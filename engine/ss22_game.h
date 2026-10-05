@@ -85,6 +85,9 @@ typedef struct ss22_game {
     /* the game's view-space units in a metre: a VR headset's eye distance and screen depth (engine/eng_xr.h). Measured from a figure of
      * known height at a known depth (focal length x height / pixels); 0 = 15000, Time Crisis' scale, not measured for the game */
     int32_t units_per_m;
+    /* its own horizontal field of view across the 4:3 picture: 2 atan(320 / focal length in pixels) -- the headset's "Screen size 100 %"
+     * (life size); 0 = 45, Time Crisis' (focal 772.6) */
+    float   hfov_deg;
 } ss22_game;
 
 /* Run the game's start script NAME (ss22_game.start) from now: its frame n counts from this call. The Esc menu's way to --stage. */

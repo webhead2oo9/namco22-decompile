@@ -40,6 +40,7 @@
 #include "rr_hw.h"
 #include "rr_sound.h"
 #include "rr_net.h"
+#include "eng_xr.h"
 
 static struct nk_context *ctx;
 static SDL_Window *uwin;
@@ -59,10 +60,15 @@ static int dlg_mode = 1;               /* 0 = Local LAN, 1 = Internet game (the 
 static bool was_session;               /* GO edge detector: close the menu when a race is armed */
 static float ui_scale = 1.0f;          /* drawable pixels per window unit (HiDPI) */
 
-enum { T_FILE, T_DISPLAY, T_AUDIO, T_CONTROLS, T_RECORD, T_ONLINE, T_N };
-static const char *tab_name[T_N] = { "File", "Display", "Audio", "Controls", "Record", "Online" };
+/* VR: the headset's settings (engine/eng_xr.h eng_xr_rows), a page only while a VR session runs (rr_ui_set_vr): it is the last tab,
+ * and without VR the strip simply ends one tab sooner */
+enum { T_FILE, T_DISPLAY, T_AUDIO, T_CONTROLS, T_RECORD, T_ONLINE, T_VR, T_N };
+static const char *tab_name[T_N] = { "File", "Display", "Audio", "Controls", "Record", "Online", "VR" };
+static bool vr_tab;
+static int ntabs(void) { return vr_tab ? T_N : T_VR; }
 static int tab = T_DISPLAY;
 static int row = 0;                    /* -1 = the tab strip */
+void rr_ui_set_vr(bool on) { vr_tab = on; if (!on && tab == T_VR) tab = T_DISPLAY; }
 static bool kb_moved;                  /* keep the selected row in view after a key */
 
 /* ---- the rows ------------------------------------------------------------- */
@@ -86,6 +92,7 @@ static int nrows(int t)
     case T_CONTROLS: return C_N + RR_ACT_N;
     case T_RECORD: return 1;
     case T_ONLINE: return online_rows();
+    case T_VR: return eng_xr_rows();
     }
     return 0;
 }
@@ -96,6 +103,7 @@ static bool has_value(int t, int r)
     if (t == T_CONTROLS) return r < C_N;
     if (t == T_RECORD) return true;
     if (t == T_ONLINE) return r == O_SERVER || r == O_NAME || (rr_net_connected() && r == O_LOBBY0 + rr_net_roster_count());   /* server / name / ready */
+    if (t == T_VR) return eng_xr_row_value(r);
     return false;
 }
 static bool row_enabled(int t, int r)
@@ -182,6 +190,7 @@ static void row_text(int t, int r, char *label, size_t ln, char *value, size_t v
             else snprintf(label, ln, "Start race");
         }
         break; }
+    case T_VR: eng_xr_row_text(r, label, ln, value, vn); break;
     }
 }
 static void begin_edit(int r)
@@ -282,6 +291,7 @@ static void row_change(int t, int r, int dir)
         } else if (r == O_LOBBY0 + rc) rr_net_set_ready(!online_self_ready());
         else if (r == O_LOBBY0 + rc + 1 && dir == 0) rr_net_request_start();
         break; }
+    case T_VR: eng_xr_row_change(r, dir); break;
     }
 }
 
@@ -383,14 +393,23 @@ static void nav(int k)
     switch (k) {
     case K_UP:    row = row <= -1 ? n - 1 : row - 1; break;
     case K_DOWN:  row = row >= n - 1 ? -1 : row + 1; break;
-    case K_LEFT:  if (row < 0) tab = cyc(tab, -1, T_N); else if (has_value(tab, row)) row_change(tab, row, -1); break;
-    case K_RIGHT: if (row < 0) tab = cyc(tab, +1, T_N); else if (has_value(tab, row)) row_change(tab, row, +1); break;
+    case K_LEFT:  if (row < 0) tab = cyc(tab, -1, ntabs()); else if (has_value(tab, row)) row_change(tab, row, -1); break;
+    case K_RIGHT: if (row < 0) tab = cyc(tab, +1, ntabs()); else if (has_value(tab, row)) row_change(tab, row, +1); break;
     case K_OK:    if (row < 0) row = 0; else row_change(tab, row, 0); break;
     case K_BACK:  if (newroom_open) { newroom_open = false; stop_edit(); } else if (dlg_open) { dlg_open = false; stop_edit(); } else close_menu(); break;
-    case K_TABPREV: tab = cyc(tab, -1, T_N); row = 0; break;
-    case K_TABNEXT: tab = cyc(tab, +1, T_N); row = 0; break;
+    case K_TABPREV: tab = cyc(tab, -1, ntabs()); row = 0; break;
+    case K_TABNEXT: tab = cyc(tab, +1, ntabs()); row = 0; break;
     }
     if (row >= nrows(tab)) row = nrows(tab) - 1;
+}
+/* the headset's controllers (engine/eng_xr.h eng_xr_menu_key): u d l r = the stick, o = OK, b = back; nothing while a text box or a
+ * binding row waits for a key */
+void rr_ui_vr_key(char c)
+{
+    if (!open_ || editing >= 0 || rebinding >= 0) return;
+    const char *const keys = "udlrob";
+    const char *p = c ? strchr(keys, c) : NULL;
+    if (p) { nav((int)(p - keys)); kb_moved = true; }
 }
 
 bool rr_ui_event(SDL_Event *e)
@@ -477,6 +496,13 @@ static void labelf(nk_flags align, const char *fmt, ...)
     char b[160];
     va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
     nk_label(ctx, b, align);
+}
+/* a note line for the VR page (engine/eng_xr.h eng_xr_notes) */
+static void vr_note(const char *fmt, ...)
+{
+    char b[160];
+    va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    nk_label(ctx, b, NK_TEXT_LEFT);
 }
 
 /* a one-line hint at the bottom of the window while the menu is closed (a pad has no Esc: how to reach the menu) */
@@ -750,13 +776,13 @@ void rr_ui_draw(bool *quit)
     /* THE MENU BAR across the top of the window, as in Prop Cycle. The chosen
      * page drops down under its title; on the keyboard the bar is the row
      * above the first row of the dropdown. */
-    static const float title_w[T_N] = { 50, 80, 70, 90, 80, 70 };
+    static const float title_w[T_N] = { 50, 80, 70, 90, 80, 70, 40 };
     float title_x[T_N], x = 4;
-    for (int t = 0; t < T_N; t++) { title_x[t] = x; x += title_w[t] + 4; }
+    for (int t = 0; t < ntabs(); t++) { title_x[t] = x; x += title_w[t] + 4; }
     if (nk_begin(ctx, "menubar", nk_rect(0, 0, (float)ww, 28), NK_WINDOW_NO_SCROLLBAR)) {
         nk_menubar_begin(ctx);
-        nk_layout_row_begin(ctx, NK_STATIC, 20, T_N + 1);
-        for (int t = 0; t < T_N; t++) {
+        nk_layout_row_begin(ctx, NK_STATIC, 20, ntabs() + 1);
+        for (int t = 0; t < ntabs(); t++) {
             nk_layout_row_push(ctx, title_w[t]);
             if (nk_select_label(ctx, tab_name[t], NK_TEXT_CENTERED, t == tab) && t != tab) { tab = t; row = 0; }
         }
@@ -767,10 +793,10 @@ void rr_ui_draw(bool *quit)
     nk_end(ctx);
 
     /* the dropdown: sized to its page, under its title, inside the window */
-    static const float drop_w[T_N] = { 300, 440, 300, 340, 380, 420 };
+    static const float drop_w[T_N] = { 300, 440, 300, 340, 380, 420, 440 };
     const int n0 = nrows(tab);
     const float rh0 = tab == T_CONTROLS ? 20 : 26;
-    float dh = 48 + n0 * (rh0 + 4) + (tab == T_DISPLAY ? 88 : tab == T_FILE ? 0 : 44);
+    float dh = 48 + n0 * (rh0 + 4) + (tab == T_DISPLAY ? 88 : tab == T_FILE ? 0 : tab == T_VR ? 110 : 44);
     if (dh > wh - 34) dh = (float)wh - 34;
     float dw = drop_w[tab] < ww - 8 ? drop_w[tab] : (float)ww - 8;
     float dx = title_x[tab];
@@ -836,6 +862,8 @@ void rr_ui_draw(bool *quit)
         } else if (tab == T_ONLINE) {
             labelf(NK_TEXT_LEFT, "Address entry needs a keyboard.");
             if (!rr_net_connected()) labelf(NK_TEXT_LEFT, "LAN: one player picks Host a LAN game, the others Find LAN games and Join. Or type a server host:port.");
+        } else if (tab == T_VR) {
+            eng_xr_notes(vr_note);
         }
 
     }

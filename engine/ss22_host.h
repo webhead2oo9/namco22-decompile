@@ -25,6 +25,7 @@ typedef struct {
     bool (*aim)(float *nx, float *ny);       /* a LIGHT GUN game: where the gun points in the 4:3 picture (false = off-screen); the host draws the crosshair and hides the pointer */
     const eng_ui_page *(*extra_page)(void);  /* the game's own menu page after Controls (Time Crisis: Stages); NULL = none */
     int32_t units_per_m;                     /* the game's view-space units in a metre, for a VR headset's stereo (engine/eng_xr.h); 0 = 15000 */
+    float   hfov_deg;                        /* its horizontal field of view across 4:3, the headset's "Screen size 100 %"; 0 = 45 */
 } ss22_host_game;
 
 /* a real window; scale <= 0 = the saved window size. vr: the picture in an OpenXR headset as well (engine/eng_xr.h), when one is there */

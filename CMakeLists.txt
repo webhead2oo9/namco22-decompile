@@ -142,6 +142,7 @@ set(PROPCYCL_ENGINE_SRC
     ${NAMCO22_ENGINE_SS22_SRC}
     ${NAMCO22_ENGINE_SND_SRC}
     ${NAMCO22_ENGINE_C25_SRC}
+    ${NAMCO22_ENGINE_XR_SRC}       # --vr: a headset (engine/eng_xr.h); its OpenXR loader is dlopen'ed: CMAKE_DL_LIBS
     gen/pc_c25.c
 )
 
@@ -181,9 +182,9 @@ if(WIN32)
     # Windows: no opengl32 import -- src/gl_dyn.c resolves OpenGL at run time, so the
     # game can fall back to the bundled Mesa (mesa/) when there is no real driver
     target_sources(propcycl PRIVATE engine/gl_dyn.c)
-    target_link_libraries(propcycl PRIVATE ${SDL2_LINK_LIBRARIES} m ZLIB::ZLIB)
+    target_link_libraries(propcycl PRIVATE ${SDL2_LINK_LIBRARIES} m ZLIB::ZLIB ${CMAKE_DL_LIBS})
 else()
-    target_link_libraries(propcycl PRIVATE ${SDL2_LINK_LIBRARIES} OpenGL::GL m ZLIB::ZLIB)
+    target_link_libraries(propcycl PRIVATE ${SDL2_LINK_LIBRARIES} OpenGL::GL m ZLIB::ZLIB ${CMAKE_DL_LIBS})
 endif()
 # Hand-written files get normal warnings
 set_source_files_properties(
@@ -279,7 +280,7 @@ add_executable(rig_viewer
     ${PROPCYCL_ENGINE_SRC}
 )
 target_include_directories(rig_viewer PRIVATE include ${SDL2_INCLUDE_DIRS})
-target_link_libraries(rig_viewer PRIVATE ${SDL2_LINK_LIBRARIES} OpenGL::GL m ZLIB::ZLIB)
+target_link_libraries(rig_viewer PRIVATE ${SDL2_LINK_LIBRARIES} OpenGL::GL m ZLIB::ZLIB ${CMAKE_DL_LIBS})
 target_compile_options(rig_viewer PRIVATE -Wall -Wno-unused-variable -Wno-unused-function)
 
 # Offline C352 gate: replays a captured register-write stream through our
@@ -311,11 +312,11 @@ list(REMOVE_ITEM PROPCYCL_ORACLE_SRC gen/snd_driver.c src/snd/snd_engine.c)
 # translation (PROPCYCL_C25=oracle selects it) -- tools/c25_gate.sh runs both.
 add_executable(propcycl_oracle src/main.c ${PROPCYCL_ENGINE_SRC} ${NAMCO22_C25_ORACLE_SRC})
 target_include_directories(propcycl_oracle PRIVATE include ${SDL2_INCLUDE_DIRS})
-target_link_libraries(propcycl_oracle PRIVATE ${SDL2_LINK_LIBRARIES} OpenGL::GL m ZLIB::ZLIB)
+target_link_libraries(propcycl_oracle PRIVATE ${SDL2_LINK_LIBRARIES} OpenGL::GL m ZLIB::ZLIB ${CMAKE_DL_LIBS})
 target_compile_definitions(propcycl_oracle PRIVATE PROPCYCL_ORACLE C25_DEV_HOOKS)
 
 add_executable(propcycl_sndoracle src/main.c ${PROPCYCL_ORACLE_SRC} tools/sndoracle/m37710.c tools/sndoracle/sound_oracle.c)
 target_include_directories(propcycl_sndoracle PRIVATE include ${SDL2_INCLUDE_DIRS})
-target_link_libraries(propcycl_sndoracle PRIVATE ${SDL2_LINK_LIBRARIES} OpenGL::GL m ZLIB::ZLIB)
+target_link_libraries(propcycl_sndoracle PRIVATE ${SDL2_LINK_LIBRARIES} OpenGL::GL m ZLIB::ZLIB ${CMAKE_DL_LIBS})
 
 endif()  # PROPCYCL_DEV_TOOLS

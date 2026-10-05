@@ -374,7 +374,8 @@ void framedump_render(geo_quad_cb cb, void *user)
 static void walk_records(geo_quad_cb cb, void *user)
 {
     int32_t zoom_mant = 0; int zoom_shift = 0; int32_t vx = 0, vy = 0;
-    eng_list_cfg cfg = { ENG_LIST_HEAD_SS22, 0, &zoom_mant, &zoom_shift, &vx, &vy };
+    extern eng_eye *renderer3d_eye(void);   /* the eye being drawn (--vr), or NULL */
+    eng_list_cfg cfg = { ENG_LIST_HEAD_SS22, 0, &zoom_mant, &zoom_shift, &vx, &vy, renderer3d_eye() };
     int prims = eng_walk_list(pw_idx, &cfg, cb, user);
     /* once per DUMP, not per rendered frame -- in single-file mode the
      * harness redraws the same dump every frame and the repeat drowned the

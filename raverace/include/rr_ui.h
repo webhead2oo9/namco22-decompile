@@ -20,7 +20,10 @@ bool rr_ui_chat_active(void);           /* the chat overlay is showing (typing, 
 /* headless tests: drive the menu without an input device */
 enum { RR_UI_UP, RR_UI_DOWN, RR_UI_LEFT, RR_UI_RIGHT, RR_UI_OK, RR_UI_BACK, RR_UI_TABPREV, RR_UI_TABNEXT };
 void rr_ui_test_nav(int k);
-void rr_ui_test_goto(int tab, int row);  /* tab: 0 File 1 Display 2 Audio 3 Controls 4 Record 5 Online */
+void rr_ui_test_goto(int tab, int row);  /* tab: 0 File 1 Display 2 Audio 3 Controls 4 Record 5 Online 6 VR (with VR on) */
+/* a VR headset (engine/eng_xr.h): its settings page, shown only while a session runs, and its controllers' menu steps */
+void rr_ui_set_vr(bool on);
+void rr_ui_vr_key(char c);              /* eng_xr_menu_key's u d l r o b, while the menu is open */
 
 /* rr_host.c: every display/audio/option change, applied and saved */
 void rr_host_set_winmode(int m);         /* 0 windowed, 1 desktop fullscreen, 2 exclusive */

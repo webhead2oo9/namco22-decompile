@@ -2,9 +2,10 @@
  * eng_xr.c -- the game in a VR headset: see eng_xr.h.
  *
  * One OpenXR session on the window's own OpenGL context (XR_KHR_opengl_enable: WGL on Windows, GLX on Linux), one swapchain per
- * eye. The engine draws each eye into an offscreen RGBA8 picture of ours, which is copied byte for byte into the swapchain image
+ * eye. The game draws each eye into an offscreen RGBA8 picture of ours, which is copied byte for byte into the swapchain image
  * (an sRGB one when the runtime offers it: the engine's pixels are display values already, and a runtime takes a UNORM image as
- * linear light and would brighten it). The two pictures go out as two quad layers at the same pose, one per eye.
+ * linear light and would brighten it). The two pictures go out as two quad layers at the same pose, one per eye. Nothing here
+ * knows which game it runs: the host fills in an eng_xr_host (its menu, its settings file, its picture's shape).
  */
 #ifndef _WIN32
 #define _GNU_SOURCE                              /* RTLD_DEFAULT */
@@ -28,8 +29,6 @@
 #define XR_NO_PROTOTYPES
 #include "../third_party/openxr/openxr.h"
 #include "../third_party/openxr/openxr_platform.h"
-#include "eng_cfg.h"
-#include "eng_display.h"
 #include "eng_xr.h"
 
 #ifndef M_PI
@@ -95,8 +94,9 @@ static XrSessionState sstate = XR_SESSION_STATE_UNKNOWN;
 static bool running;                         /* xrBeginSession .. xrEndSession */
 static XrEnvironmentBlendMode blend = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 static char runtime_name[XR_MAX_RUNTIME_NAME_SIZE], system_name[XR_MAX_SYSTEM_NAME_SIZE];
+static eng_xr_host host;                     /* the game's side (eng_xr_start) */
 static int32_t upm;                          /* the game's units in a metre */
-static bool gun_game;
+static double half_fov;                      /* half the game's own horizontal field of view across 4:3 (radians) */
 
 typedef struct { XrSwapchain sc; uint32_t n; XrSwapchainImageOpenGLKHR img[8]; } eye_chain;
 static eye_chain chain[2];
@@ -115,13 +115,14 @@ static bool frame_open, frame_render;
 
 /* the screen: in LOCAL space, facing the player at the last recenter */
 static int vr_dist_cm = 150, vr_size = 100, vr_depth = 100;
+static bool menu_now;                        /* the host's menu was open at the last poll */
 static double anchor_yaw;
 static XrVector3f anchor_pos;
 static bool recenter_pending = true;
 
 /* the controllers */
 static XrActionSet aset;
-static XrAction a_aim, a_trigger, a_squeeze, a_coin, a_recenter, a_haptic, a_menu, a_nav;
+static XrAction a_aim, a_trigger, a_squeeze, a_coin, a_recenter, a_haptic, a_menu, a_nav, a_stick;
 static XrPath hand[2];
 static XrSpace aim_space[2];
 static int gun_hand = 1;                     /* the hand that pulled its trigger last (the right one to begin with) */
@@ -129,11 +130,15 @@ static bool gun_ok, gun_in;
 static float gun_x = 0.5f, gun_y = 0.5f;
 static unsigned buttons;
 static char mkeys[8]; static int mk_n;       /* the menu's steps from the controllers, for the host (eng_xr_menu_key) */
+static eng_xr_pad pad;                       /* the controllers as a pad, at the last poll */
+static bool pad_ok;
 
-/* the menu in the headset: the window's menu drawn into this overlay, then over both eyes' pictures */
+/* the menu in the headset: the window's menu drawn into this overlay, then over both eyes' pictures; the controller is its pointer */
 static GLuint ov_tex, ov_fbo;
 static int ov_w, ov_h;
 static bool ov_on;                           /* it holds this frame's menu */
+static bool ptr_ok, ptr_down;                /* the pointer is on the screen (window points ptr_x, ptr_y); its button is down */
+static int ptr_x, ptr_y;
 
 static const char *res_str(XrResult r)
 {
@@ -161,7 +166,7 @@ static XrVector3f quat_rot(XrQuaternionf q, XrVector3f v)  /* q v q* */
     const float tx = 2 * (q.y * v.z - q.z * v.y), ty = 2 * (q.z * v.x - q.x * v.z), tz = 2 * (q.x * v.y - q.y * v.x);
     return (XrVector3f){ v.x + q.w * tx + (q.y * tz - q.z * ty), v.y + q.w * ty + (q.z * tx - q.x * tz), v.z + q.w * tz + (q.x * ty - q.y * tx) };
 }
-static double scr_w43(void) { return 2.0 * (vr_dist_cm / 100.0) * tan(22.5 * M_PI / 180.0) * vr_size / 100.0; }   /* the 4:3 picture's width (m) */
+static double scr_w43(void) { return 2.0 * (vr_dist_cm / 100.0) * tan(half_fov) * vr_size / 100.0; }   /* the 4:3 picture's width (m) */
 static double scr_h(void)   { return scr_w43() * 0.75; }
 static XrPosef screen_pose(void)
 {
@@ -172,10 +177,13 @@ static XrPosef screen_pose(void)
     return p;
 }
 
-void eng_xr_stereo(int32_t *sep, int32_t *zconv)
+void eng_xr_stereo(int32_t *sep, int32_t *zconv, float *focal_max)
 {
     *sep   = (int32_t)(0.064 * upm * vr_depth / 100.0 + 0.5);
     *zconv = (int32_t)(vr_dist_cm / 100.0 * upm + 0.5);
+    /* infinity on the screen: focal * sep / zconv pixels of the 640, on a screen scr_w43() wide -- 0.064 m (the eyes' own) * depth *
+     * size * focal / (320 / tan(half_fov)): the game's own lens at size 100 % puts it at the eyes' separation, a longer one past */
+    *focal_max = (float)(320.0 / tan(half_fov) * 100.0 / vr_size);
 }
 
 /* ---- the loader ---------------------------------------------------------------------------------------------------------------- */
@@ -270,8 +278,8 @@ static void destroy_chains(void)
 }
 static void want_size(int *w, int *h)
 {
-    *h = 960;                                                    /* twice the board's lines: the screen spans ~45 degrees */
-    *w = g_eng_disp.wide ? (*h * 16 + 4) / 9 : *h * 4 / 3;      /* widescreen: a wider screen, the world wider (Hor+) */
+    *h = 960;                                                    /* twice the board's lines */
+    *w = host.wide && host.wide() ? (*h * 16 + 4) / 9 : *h * 4 / 3;   /* widescreen: a wider screen, the world wider (Hor+) */
 }
 static bool make_chains(int w, int h)
 {
@@ -325,36 +333,38 @@ static bool make_actions(void)
     if (!XR_OK(xrCreateActionSet(inst, &ci, &aset), "xrCreateActionSet")) return false;
     if (!make_action(&a_aim, "aim", "Aim", XR_ACTION_TYPE_POSE_INPUT) ||
         !make_action(&a_trigger, "trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT) ||
-        !make_action(&a_squeeze, "pedal", "Pedal", XR_ACTION_TYPE_FLOAT_INPUT) ||
-        !make_action(&a_coin, "coin", "Insert coin", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
-        !make_action(&a_recenter, "recenter", "Recenter the screen", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+        !make_action(&a_squeeze, "grip", "Grip (pedal)", XR_ACTION_TYPE_FLOAT_INPUT) ||
+        !make_action(&a_coin, "a_x", "A / X (coin)", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+        !make_action(&a_recenter, "b_y", "B / Y (recenter)", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
         !make_action(&a_haptic, "recoil", "Recoil", XR_ACTION_TYPE_VIBRATION_OUTPUT) ||
         !make_action(&a_menu, "menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
-        !make_action(&a_nav, "menu_steps", "Menu steps", XR_ACTION_TYPE_VECTOR2F_INPUT)) return false;
-    /* each profile's components under /user/hand/<side>/ ("<" = the left hand's only: a component a profile lacks on one side
-     * fails that profile's whole suggestion); a runtime that does not know a profile says so, and that is no failure */
-    struct prof { const char *name; const char *comp[8]; } profs[] = {      /* aim, trigger, pedal, coin, recenter, haptic, menu, menu steps */
+        !make_action(&a_nav, "stick", "Stick", XR_ACTION_TYPE_VECTOR2F_INPUT) ||
+        !make_action(&a_stick, "stick_click", "Stick click (coin / start)", XR_ACTION_TYPE_BOOLEAN_INPUT)) return false;
+    /* each profile's components under /user/hand/<side>/ ("<" / ">" = the left / right hand's only: a component a profile lacks on
+     * one side fails that profile's whole suggestion, and the menu button takes one side's stick click where there is no menu button
+     * to spare); a runtime that does not know a profile says so, and that is no failure */
+    struct prof { const char *name; const char *comp[9]; } profs[] = {   /* aim, trigger, grip, A/X, B/Y, haptic, menu, stick, stick click */
         { "/interaction_profiles/oculus/touch_controller", { "input/aim/pose", "input/trigger/value", "input/squeeze/value", "*a|x", "*b|y", "output/haptic",
-                                                             "<input/menu/click", "input/thumbstick" } },
+                                                             "<input/menu/click", "input/thumbstick", "input/thumbstick/click" } },
         { "/interaction_profiles/valve/index_controller",  { "input/aim/pose", "input/trigger/value", "input/squeeze/value", "input/a/click", "input/b/click", "output/haptic",
-                                                             "input/thumbstick/click", "input/thumbstick" } },
+                                                             ">input/thumbstick/click", "input/thumbstick", "<input/thumbstick/click" } },
         { "/interaction_profiles/htc/vive_controller",     { "input/aim/pose", "input/trigger/value", "input/squeeze/click", "input/menu/click", NULL, "output/haptic",
-                                                             "input/trackpad/click", "input/trackpad" } },
+                                                             ">input/trackpad/click", "input/trackpad", "<input/trackpad/click" } },
         { "/interaction_profiles/microsoft/motion_controller", { "input/aim/pose", "input/trigger/value", "input/squeeze/click", "input/menu/click", NULL, "output/haptic",
-                                                                 "input/thumbstick/click", "input/thumbstick" } },
-        { "/interaction_profiles/khr/simple_controller",   { "input/aim/pose", "input/select/click", "input/menu/click", NULL, NULL, "output/haptic", NULL, NULL } },
+                                                                 ">input/thumbstick/click", "input/thumbstick", "<input/thumbstick/click" } },
+        { "/interaction_profiles/khr/simple_controller",   { "input/aim/pose", "input/select/click", "input/menu/click", NULL, NULL, "output/haptic", NULL, NULL, NULL } },
     };
-    XrAction *acts[8] = { &a_aim, &a_trigger, &a_squeeze, &a_coin, &a_recenter, &a_haptic, &a_menu, &a_nav };
+    XrAction *acts[9] = { &a_aim, &a_trigger, &a_squeeze, &a_coin, &a_recenter, &a_haptic, &a_menu, &a_nav, &a_stick };
     for (size_t p = 0; p < sizeof profs / sizeof profs[0]; p++) {
         XrActionSuggestedBinding sb[24]; int k = 0;
-        for (int a = 0; a < 8; a++) {
+        for (int a = 0; a < 9; a++) {
             const char *c = profs[p].comp[a];
             if (!c) continue;
             for (int h = 0; h < 2; h++) {
                 char full[96];
-                if (c[0] == '<') {                                /* Touch: the menu button is the left controller's (the right one's is the system's) */
-                    if (h) continue;
-                    snprintf(full, sizeof full, "/user/hand/left/%s", c + 1);
+                if (c[0] == '<' || c[0] == '>') {                 /* one side only (Touch: the right controller's menu button is the system's) */
+                    if (h != (c[0] == '>')) continue;
+                    snprintf(full, sizeof full, "/user/hand/%s/%s", h ? "right" : "left", c + 1);
                 } else if (c[0] == '*') {                         /* Touch: a/b on the right controller, x/y on the left */
                     const char *pick = h ? c + 1 : strchr(c, '|') + 1;
                     snprintf(full, sizeof full, "/user/hand/%s/input/%c/click", h ? "right" : "left", pick[0]);
@@ -400,10 +410,12 @@ static XrVector2f act_vec2(XrAction a, int h)
     return XR_SUCCEEDED(xrGetActionStateVector2f(sess, &gi, &st)) && st.isActive ? st.currentState : (XrVector2f){ 0, 0 };
 }
 
-/* the aim ray against the screen's plane, in the screen's frame (x right, y up, the player on +z) */
+/* THE AIM RAY of the hand that pulled its trigger last, against the screen's plane, in the screen's frame (x right, y up, the player on
+ * +z): the gun's point in the 4:3 picture (gun_x, gun_y; gun_in = on it), and the menu pointer's in the whole picture, in the window's
+ * points (the menu lays itself out in the window, and the overlay spreads the window over the whole picture) */
 static void aim_update(void)
 {
-    gun_ok = false;
+    gun_ok = ptr_ok = false;
     if (!last_time || !aim_space[gun_hand]) return;
     XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
     if (XR_FAILED(xrLocateSpace(aim_space[gun_hand], local_space, last_time, &loc))) return;
@@ -417,18 +429,49 @@ static void aim_update(void)
     if (ld.z >= -1e-4f) return;                           /* pointing away from the screen: off-screen */
     const float t = -lo.z / ld.z;
     if (t <= 0) return;
-    const double u = lo.x + t * ld.x, v = lo.y + t * ld.y, w = scr_w43(), hgt = scr_h();
-    gun_x = (float)(0.5 + u / w); gun_y = (float)(0.5 - v / hgt);
+    const double u = lo.x + t * ld.x, v = lo.y + t * ld.y, hgt = scr_h();
+    gun_x = (float)(0.5 + u / scr_w43()); gun_y = (float)(0.5 - v / hgt);
     gun_in = gun_x >= 0 && gun_x <= 1 && gun_y >= 0 && gun_y <= 1;
+    const double px = 0.5 + u / (hgt * (eye_h ? (double)eye_w / eye_h : 4.0 / 3.0)), py = 0.5 - v / hgt;
+    SDL_Window *win = SDL_GL_GetCurrentWindow();
+    int ww = 0, wh = 0;
+    if (win) SDL_GetWindowSize(win, &ww, &wh);
+    if (px >= 0 && px < 1 && py >= 0 && py < 1 && ww > 0 && wh > 0) { ptr_ok = true; ptr_x = (int)(px * ww); ptr_y = (int)(py * wh); }
+}
+/* the pointer, to the host's menu: SDL mouse events on its window, through the host's own event loop */
+static void push_mouse(Uint32 type, int x, int y, int dx, int dy)
+{
+    SDL_Window *win = SDL_GL_GetCurrentWindow();
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = type;
+    if (type == SDL_MOUSEMOTION) {
+        e.motion.windowID = win ? SDL_GetWindowID(win) : 0;
+        e.motion.x = x; e.motion.y = y; e.motion.xrel = dx; e.motion.yrel = dy;
+        e.motion.state = ptr_down ? SDL_BUTTON_LMASK : 0;
+    } else {
+        e.button.windowID = win ? SDL_GetWindowID(win) : 0;
+        e.button.button = SDL_BUTTON_LEFT; e.button.clicks = 1;
+        e.button.state = type == SDL_MOUSEBUTTONDOWN ? SDL_PRESSED : SDL_RELEASED;
+        e.button.x = x; e.button.y = y;
+    }
+    SDL_PushEvent(&e);
 }
 
 bool eng_xr_gun(float *nx, float *ny, bool *inside)
 {
-    if (!running || !gun_game || !gun_ok) return false;
+    if (!running || !host.light_gun || !gun_ok) return false;
     *nx = gun_x; *ny = gun_y; *inside = gun_in;
     return true;
 }
-unsigned eng_xr_buttons(void) { return running ? buttons : 0; }
+unsigned eng_xr_buttons(void) { return running && host.light_gun ? buttons : 0; }
+bool eng_xr_get_pad(eng_xr_pad *p)
+{
+    if (!running || !pad_ok) return false;
+    *p = pad;
+    return true;
+}
+static int16_t axis16(float v) { v = v < -1 ? -1 : v > 1 ? 1 : v; return (int16_t)(v * 32767.0f); }
 char eng_xr_menu_key(void)
 {
     if (!mk_n) return 0;
@@ -451,10 +494,13 @@ static void menu_stick(float x, float y)
 void eng_xr_rumble(float amplitude, uint32_t ms)
 {
     if (!running || sstate != XR_SESSION_STATE_FOCUSED) return;
-    XrHapticActionInfo hi = { XR_TYPE_HAPTIC_ACTION_INFO }; hi.action = a_haptic; hi.subactionPath = hand[gun_hand];
     XrHapticVibration v = { XR_TYPE_HAPTIC_VIBRATION };
     v.duration = (XrDuration)ms * 1000000; v.frequency = XR_FREQUENCY_UNSPECIFIED; v.amplitude = amplitude < 0 ? 0 : amplitude > 1 ? 1 : amplitude;
-    xrApplyHapticFeedback(sess, &hi, (const XrHapticBaseHeader *)&v);
+    for (int h = 0; h < 2; h++) {                    /* a light gun: its hand; a pad: both, as a pad's two motors */
+        if (host.light_gun && h != gun_hand) continue;
+        XrHapticActionInfo hi = { XR_TYPE_HAPTIC_ACTION_INFO }; hi.action = a_haptic; hi.subactionPath = hand[h];
+        xrApplyHapticFeedback(sess, &hi, (const XrHapticBaseHeader *)&v);
+    }
 }
 
 /* ---- start / stop ------------------------------------------------------------------------------------------------------------ */
@@ -466,13 +512,17 @@ static int gl_version(void)                                  /* major * 100 + mi
     return ma * 100 + mi;
 }
 
-bool eng_xr_start(const char *app, int32_t units_per_m, bool light_gun)
+static int cfg_get(const char *key, int def) { return host.cfg_get ? host.cfg_get(key, def) : def; }
+static void cfg_set(const char *key, int v) { if (host.cfg_set) host.cfg_set(key, v); }
+
+bool eng_xr_start(const eng_xr_host *h)
 {
-    upm = units_per_m > 0 ? units_per_m : 15000;
-    gun_game = light_gun;
-    vr_dist_cm = eng_cfg_int("vr_distance_cm", 150); if (vr_dist_cm < 50 || vr_dist_cm > 500) vr_dist_cm = 150;
-    vr_size    = eng_cfg_int("vr_size", 100);        if (vr_size < 40 || vr_size > 250) vr_size = 100;
-    vr_depth   = eng_cfg_int("vr_depth", 100);       if (vr_depth < 0 || vr_depth > 300) vr_depth = 100;
+    host = *h;
+    upm = host.units_per_m > 0 ? host.units_per_m : 15000;
+    half_fov = (host.hfov_deg > 1 && host.hfov_deg < 170 ? host.hfov_deg : 45.0) * M_PI / 360.0;
+    vr_dist_cm = cfg_get("vr_distance_cm", 150); if (vr_dist_cm < 50 || vr_dist_cm > 500) vr_dist_cm = 150;
+    vr_size    = cfg_get("vr_size", 100);        if (vr_size < 40 || vr_size > 250) vr_size = 100;
+    vr_depth   = cfg_get("vr_depth", 100);       if (vr_depth < 0 || vr_depth > 300) vr_depth = 100;
     if (!gl_load()) { fprintf(stderr, "[VR] this OpenGL has no framebuffer objects\n"); return false; }
     if (!load_loader()) return false;
     PFN_xrEnumerateInstanceExtensionProperties enum_ext = NULL; PFN_xrCreateInstance create = NULL;
@@ -493,7 +543,7 @@ bool eng_xr_start(const char *app, int32_t units_per_m, bool light_gun)
 
     const char *exts[] = { XR_KHR_OPENGL_ENABLE_EXTENSION_NAME };
     XrInstanceCreateInfo ici = { XR_TYPE_INSTANCE_CREATE_INFO };
-    snprintf(ici.applicationInfo.applicationName, sizeof ici.applicationInfo.applicationName, "%s", app);
+    snprintf(ici.applicationInfo.applicationName, sizeof ici.applicationInfo.applicationName, "%s", host.app ? host.app : "namco22");
     snprintf(ici.applicationInfo.engineName, sizeof ici.applicationInfo.engineName, "namco22");
     ici.applicationInfo.applicationVersion = 1; ici.applicationInfo.engineVersion = 1;
     ici.applicationInfo.apiVersion = XR_API_VERSION_1_0;
@@ -539,8 +589,8 @@ bool eng_xr_start(const char *app, int32_t units_per_m, bool light_gun)
     for (uint32_t i = 0; i < nf && !chain_fmt; i++) if (fmts[i] == GL_RGBA8) chain_fmt = fmts[i];
     if (!chain_fmt) chain_fmt = fmts[0];
     if (chain_fmt != GL_SRGB8_ALPHA8) fprintf(stderr, "[VR] no sRGB swapchain: the picture may look brighter than in the window\n");
-    int w, h; want_size(&w, &h);
-    if (!make_chains(w, h)) { eng_xr_stop(); return false; }
+    int pw, ph; want_size(&pw, &ph);
+    if (!make_chains(pw, ph)) { eng_xr_stop(); return false; }
     {   XrSwapchainCreateInfo ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
         ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT; ci.format = chain_fmt; ci.sampleCount = 1;
         ci.width = ci.height = BG_SIZE; ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
@@ -572,7 +622,7 @@ void eng_xr_stop(void)
     if (inst) xrDestroyInstance(inst);
     sess = XR_NULL_HANDLE; inst = XR_NULL_HANDLE; local_space = view_space = XR_NULL_HANDLE;
     aim_space[0] = aim_space[1] = XR_NULL_HANDLE; aset = XR_NULL_HANDLE;
-    running = false; frame_open = false; last_time = 0; gun_ok = false; buttons = 0; mk_n = 0;
+    running = false; frame_open = false; last_time = 0; gun_ok = ptr_ok = ptr_down = pad_ok = menu_now = false; buttons = 0; mk_n = 0;
     if (ov_fbo) del_fb(1, &ov_fbo);
     if (ov_tex) glDeleteTextures(1, &ov_tex);
     ov_fbo = ov_tex = 0; ov_w = ov_h = 0; ov_on = false;
@@ -616,40 +666,70 @@ void eng_xr_poll(void)
     }
     if (lost) { fprintf(stderr, "[VR] the headset session ended: the game goes on in the window\n"); eng_xr_stop(); return; }
 
-    buttons = 0;
-    if (!running || sstate != XR_SESSION_STATE_FOCUSED) { gun_ok = false; return; }
+    buttons = 0; pad_ok = false;
+    menu_now = host.menu_open && host.menu_open();
+    if (!running || sstate != XR_SESSION_STATE_FOCUSED) { gun_ok = ptr_ok = false; return; }
     XrActiveActionSet as = { aset, XR_NULL_PATH };
     XrActionsSyncInfo si = { XR_TYPE_ACTIONS_SYNC_INFO }; si.countActiveActionSets = 1; si.activeActionSets = &as;
-    if (XR_FAILED(xrSyncActions(sess, &si))) { gun_ok = false; return; }
+    if (XR_FAILED(xrSyncActions(sess, &si))) { gun_ok = ptr_ok = false; return; }
     static bool trig_prev[2], cen_prev, menu_prev, ok_prev;
-    bool cen = false, menu = false;
-    float sx = 0, sy = 0;
+    bool trig[2], grip[2], ax[2], by[2], click[2], menu = false;
+    float trv[2];
+    XrVector2f stick[2];
     for (int h = 0; h < 2; h++) {
-        const bool t = act_float(a_trigger, h) > 0.5f;
-        if (t && !trig_prev[h]) gun_hand = h;           /* the gun is in the hand that fired last */
-        trig_prev[h] = t;
-        if (t) buttons |= ENG_XR_TRIGGER;
-        if (act_float(a_squeeze, h) > 0.5f) buttons |= ENG_XR_PEDAL;
-        if (act_bool(a_coin, h)) buttons |= ENG_XR_COIN;
-        cen = cen || act_bool(a_recenter, h);
+        trv[h] = act_float(a_trigger, h);
+        trig[h] = trv[h] > 0.5f;
+        if (trig[h] && !trig_prev[h]) gun_hand = h;     /* the gun (the pointer) is in the hand that pulled its trigger last */
+        trig_prev[h] = trig[h];
+        grip[h] = act_float(a_squeeze, h) > 0.5f;
+        ax[h] = act_bool(a_coin, h); by[h] = act_bool(a_recenter, h);
+        click[h] = act_bool(a_stick, h);
         menu = menu || act_bool(a_menu, h);
-        const XrVector2f s = act_vec2(a_nav, h);
-        if (s.x * s.x + s.y * s.y > sx * sx + sy * sy) { sx = s.x; sy = s.y; }
+        stick[h] = act_vec2(a_nav, h);
     }
-    /* THE MENU: its button opens it (the host does, 'm'); while it is open the stick steps, trigger / A is OK, B / Y and the menu
-     * button go back, and none of them reaches the game (the host does not read the controls while the menu is open) */
-    const bool open = eng_ui_is_open(), ok = (buttons & (ENG_XR_TRIGGER | ENG_XR_COIN)) != 0;
-    if (menu && !menu_prev) mkey(open ? 'b' : 'm');
-    if (open) {
+    const bool ok = ax[0] || ax[1], cen = by[0] || by[1];
+    aim_update();
+    if (menu_now) {
+        /* THE MENU has the controllers (the host reads none of the game's controls while it is open): the pointer and its trigger
+         * as the mouse, the stick steps, A / X is OK, B / Y and the menu button go back */
+        static int last_x = -1, last_y = -1;
+        if (ptr_ok && (ptr_x != last_x || ptr_y != last_y)) {
+            push_mouse(SDL_MOUSEMOTION, ptr_x, ptr_y, last_x < 0 ? 0 : ptr_x - last_x, last_y < 0 ? 0 : ptr_y - last_y);
+            last_x = ptr_x; last_y = ptr_y;
+        }
+        if (trig[gun_hand] != ptr_down && (ptr_ok || ptr_down) && last_x >= 0) {   /* (let go off the screen: the button comes up all the same) */
+            ptr_down = trig[gun_hand];
+            push_mouse(ptr_down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP, last_x, last_y, 0, 0);
+        }
+        if (menu && !menu_prev) mkey('b');
         if (ok && !ok_prev) mkey('o');
         if (cen && !cen_prev) mkey('b');
-        menu_stick(sx, sy);
+        const XrVector2f s = stick[0].x * stick[0].x + stick[0].y * stick[0].y > stick[1].x * stick[1].x + stick[1].y * stick[1].y ? stick[0] : stick[1];
+        menu_stick(s.x, s.y);
+        if (!ptr_ok && !ptr_down) last_x = last_y = -1;
     } else {
-        if (cen && !cen_prev) recenter_pending = true;
+        ptr_down = false;
         menu_stick(0, 0);
+        if (menu && !menu_prev) mkey('m');
+        if (host.light_gun) {                            /* THE GUN */
+            if (trig[0] || trig[1]) buttons |= ENG_XR_TRIGGER;
+            if (grip[0] || grip[1]) buttons |= ENG_XR_PEDAL;
+            if (ok) buttons |= ENG_XR_COIN;
+            if (cen && !cen_prev) recenter_pending = true;
+        } else {                                         /* THE PAD: left hand = its left half, right hand = its right half */
+            memset(&pad, 0, sizeof pad);
+            pad.axis[SDL_CONTROLLER_AXIS_LEFTX]  = axis16(stick[0].x);  pad.axis[SDL_CONTROLLER_AXIS_LEFTY]  = axis16(-stick[0].y);
+            pad.axis[SDL_CONTROLLER_AXIS_RIGHTX] = axis16(stick[1].x);  pad.axis[SDL_CONTROLLER_AXIS_RIGHTY] = axis16(-stick[1].y);
+            pad.axis[SDL_CONTROLLER_AXIS_TRIGGERLEFT] = axis16(trv[0]); pad.axis[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = axis16(trv[1]);
+            const struct { bool on; SDL_GameControllerButton b; } m[] = {
+                { ax[1], SDL_CONTROLLER_BUTTON_A }, { by[1], SDL_CONTROLLER_BUTTON_B }, { ax[0], SDL_CONTROLLER_BUTTON_X }, { by[0], SDL_CONTROLLER_BUTTON_Y },
+                { grip[0], SDL_CONTROLLER_BUTTON_LEFTSHOULDER }, { grip[1], SDL_CONTROLLER_BUTTON_RIGHTSHOULDER },
+                { click[0], SDL_CONTROLLER_BUTTON_BACK }, { click[1], SDL_CONTROLLER_BUTTON_START } };
+            for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i].on) pad.buttons |= 1u << m[i].b;
+            pad_ok = true;
+        }
     }
     cen_prev = cen; menu_prev = menu; ok_prev = ok;
-    aim_update();
 }
 
 /* ---- frames ------------------------------------------------------------------------------------------------------------------- */
@@ -666,7 +746,7 @@ static void recenter(XrTime t)
     fprintf(stderr, "[VR] screen in front of you: yaw %.0f deg, eyes at %.2f %.2f %.2f m\n", anchor_yaw * 180 / M_PI, anchor_pos.x, anchor_pos.y, anchor_pos.z);
 }
 
-bool eng_xr_frame_begin(int *w, int *h)
+static bool frame_begin(int *w, int *h)
 {
     frame_open = frame_render = ov_on = false;
     if (!running) return false;
@@ -683,13 +763,14 @@ bool eng_xr_frame_begin(int *w, int *h)
     return frame_render;
 }
 
-void eng_xr_eye_target(int eye)
+static void eye_target(int eye)
 {
     bind_fb(GL_FRAMEBUFFER, eye_fbo[eye & 1]);
     glViewport(0, 0, eye_w, eye_h);
 }
 
-bool eng_xr_overlay_begin(int w, int h)
+/* THE MENU'S OVERLAY: clear, the window's drawable size, GL's draw framebuffer while the host's menu draws itself */
+static bool overlay_begin(int w, int h)
 {
     ov_on = false;
     if (!frame_render || w < 1 || h < 1) return false;
@@ -713,14 +794,37 @@ bool eng_xr_overlay_begin(int w, int h)
     glClear(GL_COLOR_BUFFER_BIT);
     return ov_on = true;
 }
-void eng_xr_overlay_end(void) { bind_fb(GL_FRAMEBUFFER, 0); }
+/* the pointer on the overlay: a white dot in a dark ring, where the controller points (ptr_x, ptr_y: window points) */
+static void disc(float x, float y, float r, float c)
+{
+    glColor4f(c, c, c, 1);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(x, y);
+    for (int i = 0; i <= 20; i++) glVertex2f(x + r * cosf((float)(i * 2 * M_PI / 20)), y + r * sinf((float)(i * 2 * M_PI / 20)));
+    glEnd();
+}
+static void pointer_dot(SDL_Window *win, int dw, int dh)
+{
+    int ww, wh; SDL_GetWindowSize(win, &ww, &wh);
+    if (ww < 1 || wh < 1) return;
+    const float x = ptr_x * (float)dw / (float)ww, y = ptr_y * (float)dh / (float)wh, r = (float)dh / 120.0f + 2.0f;
+    glViewport(0, 0, dw, dh);
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT);
+    glDisable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_ALPHA_TEST);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0, dw, dh, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    disc(x, y, r * 1.6f, 0.0f);
+    disc(x, y, r, 1.0f);
+    glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+    glPopAttrib();
+}
 
 /* The menu draws itself with (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) into the clear overlay, so its colour is premultiplied: ONE over the
  * picture. (Its alpha is squared on a translucent pixel, so a see-through panel shows a little more of the game than in the window.) */
-void eng_xr_overlay_draw(void)
+static void overlay_draw(int eye)
 {
     if (!ov_on) return;
-    glViewport(0, 0, eye_w, eye_h);
+    eye_target(eye);                                 /* (the game's drawing may have left another framebuffer bound) */
     glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_TEXTURE_BIT);
     glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_ALPHA_TEST); glDisable(GL_CULL_FACE);
     glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, ov_tex);
@@ -775,7 +879,7 @@ static bool backdrop(XrCompositionLayerProjection *pl, XrCompositionLayerProject
     return true;
 }
 
-void eng_xr_frame_end(void)
+static void frame_end(void)
 {
     if (!frame_open) return;
     frame_open = false;
@@ -827,7 +931,7 @@ void eng_xr_frame_end(void)
     XR_OK(xrEndFrame(sess, &ei), "xrEndFrame");
 }
 
-void eng_xr_mirror(int x, int y, int w, int h, bool sharp)
+static void mirror(int x, int y, int w, int h, bool sharp)
 {
     int dw, dh; SDL_GL_GetDrawableSize(SDL_GL_GetCurrentWindow(), &dw, &dh);
     bind_fb(GL_FRAMEBUFFER, 0);
@@ -843,6 +947,35 @@ void eng_xr_mirror(int x, int y, int w, int h, bool sharp)
     bind_fb(GL_FRAMEBUFFER, 0);
 }
 
+bool eng_xr_present(SDL_Window *win, void (*draw_eye)(int eye, int w, int h, void *u), void (*draw_menu)(void *u),
+                    bool menu_visible, void *u, bool sharp, SDL_Rect *mirror_r)
+{
+    if (!running) return false;
+    int ew = 0, eh = 0, dw, dh;
+    SDL_GL_GetDrawableSize(win, &dw, &dh);
+    if (frame_begin(&ew, &eh)) {
+        if (menu_visible && draw_menu && overlay_begin(dw, dh)) {   /* the menu once, at the window's size */
+            draw_menu(u);
+            if (menu_now && ptr_ok) pointer_dot(win, dw, dh);
+            bind_fb(GL_FRAMEBUFFER, 0);
+        }
+        for (int e = 0; e < 2; e++) {
+            eye_target(e);
+            draw_eye(e, ew, eh, u);
+            overlay_draw(e);
+        }
+    }
+    frame_end();
+    const int pw = eye_w > 0 ? eye_w : 4, ph = eye_h > 0 ? eye_h : 3;   /* the window: the left eye, letterboxed to its shape */
+    SDL_Rect r = { 0, 0, dw, (int)((double)dw * ph / pw + 0.5) };
+    if (r.h > dh) { r.h = dh; r.w = (int)((double)dh * pw / ph + 0.5); }
+    r.x = (dw - r.w) / 2; r.y = (dh - r.h) / 2;
+    mirror(r.x, r.y, r.w, r.h, sharp);
+    if (mirror_r) *mirror_r = r;
+    return true;
+}
+void eng_xr_eye_size(int *w, int *h) { *w = eye_w; *h = eye_h; }
+
 bool eng_xr_read_eye(int eye)
 {
     if (!have_pics) return false;
@@ -851,11 +984,11 @@ bool eng_xr_read_eye(int eye)
 }
 void eng_xr_read_done(void) { bind_fb(GL_FRAMEBUFFER, 0); }
 
-/* ---- the menu's VR page ------------------------------------------------------------------------------------------------------- */
+/* ---- the VR settings, for any menu ------------------------------------------------------------------------------------------- */
 enum { V_DIST, V_SIZE, V_DEPTH, V_CENTER, V_N };
-static int vr_n(void) { return V_N; }
-static bool vr_val(int r) { return r != V_CENTER; }
-static void vr_text(int r, char *l, size_t ln, char *v, size_t vn)
+int  eng_xr_rows(void) { return V_N; }
+bool eng_xr_row_value(int r) { return r != V_CENTER; }
+void eng_xr_row_text(int r, char *l, size_t ln, char *v, size_t vn)
 {
     *v = 0;
     switch (r) {
@@ -865,22 +998,21 @@ static void vr_text(int r, char *l, size_t ln, char *v, size_t vn)
     case V_CENTER: snprintf(l, ln, "Screen"); snprintf(v, vn, "Recenter in front of you"); break;
     }
 }
-static void vr_change(int r, int dir)
+void eng_xr_row_change(int r, int dir)
 {
     const int d = dir ? dir : 1;
     switch (r) {
-    case V_DIST:   vr_dist_cm += 25 * d; if (vr_dist_cm < 50) vr_dist_cm = 50; if (vr_dist_cm > 500) vr_dist_cm = 500; eng_cfg_set_int("vr_distance_cm", vr_dist_cm); break;
-    case V_SIZE:   vr_size += 10 * d; if (vr_size < 40) vr_size = 40; if (vr_size > 250) vr_size = 250; eng_cfg_set_int("vr_size", vr_size); break;
-    case V_DEPTH:  vr_depth += 10 * d; if (vr_depth < 0) vr_depth = 0; if (vr_depth > 300) vr_depth = 300; eng_cfg_set_int("vr_depth", vr_depth); break;
+    case V_DIST:   vr_dist_cm += 25 * d; if (vr_dist_cm < 50) vr_dist_cm = 50; if (vr_dist_cm > 500) vr_dist_cm = 500; cfg_set("vr_distance_cm", vr_dist_cm); break;
+    case V_SIZE:   vr_size += 10 * d; if (vr_size < 40) vr_size = 40; if (vr_size > 250) vr_size = 250; cfg_set("vr_size", vr_size); break;
+    case V_DEPTH:  vr_depth += 10 * d; if (vr_depth < 0) vr_depth = 0; if (vr_depth > 300) vr_depth = 300; cfg_set("vr_depth", vr_depth); break;
     case V_CENTER: if (dir == 0) recenter_pending = true; break;
     }
 }
-static void vr_notes(void (*line)(const char *fmt, ...))
+void eng_xr_notes(void (*line)(const char *fmt, ...))
 {
     line("%s%s%s: %s", runtime_name[0] ? runtime_name : "no OpenXR runtime", system_name[0] ? ", " : "", system_name,
          sess ? state_name(sstate) : "off (start with --vr)");
-    line("%s", gun_game ? "Trigger: shoot  Grip: pedal  A/X: coin  B/Y: recenter" : "A/X: coin  B/Y: recenter the screen");
-    line("Menu: menu button (Index/WMR: stick click, Vive: pad)");   /* in it: the stick, trigger / A = OK, B / Y = back */
+    line("%s", host.light_gun ? "Trigger: shoot  Grip: pedal  A/X: coin  B/Y: recenter"
+                              : "A pad: sticks, triggers, grips  L-stick click: coin");
+    line("Menu: menu button (Index/WMR: R-stick click). Point, pull");   /* in it: the pointer + trigger, the stick, A = OK, B / Y = back */
 }
-static const eng_ui_page vr_page = { "VR", 520, 150, 0, vr_n, vr_val, NULL, vr_text, vr_change, vr_notes };
-const eng_ui_page *eng_xr_page(void) { return &vr_page; }

@@ -93,6 +93,27 @@ static int s22_fog_quad(const geo_quad *q, eng_fog *f)
 static geo_quad *qbuf;
 static int       qn, qcap, qorder;
 
+/* STEREO (rr_gl_set_stereo, a VR headset): the right eye's sorted quads; qbuf holds the left eye's (or the one camera's). eye_swap
+ * trades the two, so the walk, the sort and the draw use one set of names for either eye -- engine/ss22_gl.c does the same for the
+ * Super 22 games. Only the list's full-frame viewports see the eyes (engine/slave_list.h eng_eye): the direct polys and the text
+ * layer are the same in both, ON the screen's plane. */
+static geo_quad *qbuf_r;
+static int       qn_r, qcap_r;
+static int32_t   st_sep, st_zconv;            /* the next prepare's eyes (0 = the game's camera) */
+static float     st_fmax;                     /* their longest full-depth lens (slave_list.h eng_eye.focal_max) */
+static bool      st_frame;                    /* the prepared frame has two eyes */
+static float     st_focal;                    /* its full-frame viewport's focal length, pixels (0 = no world this frame) */
+static void eye_swap(void)
+{
+    geo_quad *b = qbuf; qbuf = qbuf_r; qbuf_r = b;
+    int n = qn; qn = qn_r; qn_r = n;
+    n = qcap; qcap = qcap_r; qcap_r = n;
+}
+static int32_t eye_dx(int eye) { return eye ? st_sep - st_sep / 2 : -(st_sep / 2); }   /* the pair's two halves add up to st_sep */
+void  rr_gl_set_stereo(int32_t sep, int32_t zconv, float focal_max) { st_sep = sep > 0 ? sep : 0; st_zconv = zconv; st_fmax = focal_max; }
+bool  rr_gl_stereo_frame(void) { return st_frame; }
+float rr_gl_focal(void) { return st_focal; }
+
 static void push_quad(const geo_quad *q, void *user)
 {
     (void)user;
@@ -288,16 +309,24 @@ void rr_gl_prepare(bool slave_active)
     frame_bg_palbase   = mixer_b(0x04) << 8 & 0x7f00;
     frame_text_palbase = mixer_b(0x07) << 8 & 0x7f00;
 
-    /* direct polys first (they arrived during the frame), then the list */
+    /* direct polys first (they arrived during the frame), then the list -- once per eye: the right eye's into its own buffer (the
+     * walk only reads polygon RAM and the point ROM, so walking it twice changes nothing the game sees) */
     const bool walk = rr_scene_frame(slave_active);
-    qn = 0; qorder = 0;
-    for (int i = 0; i < rr_scene_direct_count(); i++) direct_quad(rr_scene_direct(i));
-    rr_scene_consume();
-    if (walk) {
-        eng_list_cfg cfg = { ENG_LIST_HEAD_S22, 1, NULL, NULL, NULL, NULL };
-        eng_walk_list(poly_word, &cfg, push_quad, NULL);
+    st_frame = st_sep > 0; st_focal = 0;
+    eng_eye eye[2] = { { eye_dx(0), st_zconv, st_fmax, 0 }, { eye_dx(1), st_zconv, st_fmax, 0 } };
+    for (int e = 0; e < (st_frame ? 2 : 1); e++) {
+        if (e) eye_swap();
+        qn = 0; qorder = 0;
+        for (int i = 0; i < rr_scene_direct_count(); i++) direct_quad(rr_scene_direct(i));
+        if (walk) {
+            eng_list_cfg cfg = { ENG_LIST_HEAD_S22, 1, NULL, NULL, NULL, NULL, st_frame ? &eye[e] : NULL };
+            eng_walk_list(poly_word, &cfg, push_quad, NULL);
+        }
+        eng_quad_sort(qbuf, qn, 0);
+        if (e) eye_swap();
     }
-    eng_quad_sort(qbuf, qn, 0);
+    rr_scene_consume();
+    if (st_frame) st_focal = eye[0].focal;
     { static int want = -1, n;                          /* RR_CLIPLOG=<n>: the distinct viewport clip windows of screen update n */
       if (want < 0) { const char *e = getenv("RR_CLIPLOG"); want = e ? atoi(e) : 0; }
       if (want && n + 1 == want) {                       /* per priority band: how many quads and where (the HUD's polygons are the small bands) */
@@ -349,6 +378,13 @@ void rr_gl_prepare(bool slave_active)
 }
 
 int rr_gl_quads(void) { return qn; }
+void rr_gl_draw_eye(int eye, int vw, int vh)
+{
+    const bool right = st_frame && eye == 1;
+    if (right) eye_swap();
+    rr_gl_draw(vw, vh);
+    if (right) eye_swap();
+}
 
 void rr_gl_draw(int vw, int vh)
 {

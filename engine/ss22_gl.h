@@ -44,9 +44,10 @@ void ss22_prepare(const ss22_regs *r);
 /* Draw the prepared frame into the current framebuffer, vw x vh pixels (any number of times after one prepare). */
 void ss22_draw(int vw, int vh);
 /* STEREO (a headset, engine/eng_xr.c): sep = the distance between the eyes and zconv = the depth that shows ON the screen's plane, both
- * in the game's view-space units (engine/slave_list.h eng_eye); sep 0 = the game's one camera. From the next prepare on, the display
- * list is walked once per eye; the text layer, the HUD's sprites and sub-window viewports stay flat on the screen's plane. */
-void ss22_set_stereo(int32_t sep, int32_t zconv);
+ * in the game's view-space units, and focal_max = the longest lens shown at full depth (pixels; 0 = no limit) -- engine/slave_list.h
+ * eng_eye; sep 0 = the game's one camera. From the next prepare on, the display list is walked once per eye; the text layer, the
+ * HUD's sprites and sub-window viewports stay flat on the screen's plane. */
+void ss22_set_stereo(int32_t sep, int32_t zconv, float focal_max);
 bool ss22_stereo_frame(void);                /* the prepared frame has two eyes */
 void ss22_draw_eye(int eye, int vw, int vh); /* 0 left, 1 right; a mono frame draws its one picture (ss22_draw = eye 0) */
 int  ss22_quads(void);                       /* quads in the prepared frame */

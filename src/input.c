@@ -78,6 +78,7 @@
 #include <stdio.h>
 #include "ui_menu.h"
 #include "pedal_enc.h"        /* an exercise bike's encoder / a Peloton as the pedal */
+#include "eng_xr.h"           /* a VR headset's controllers as a pad (--vr) */
 
 /* MCU shared RAM, relative to commsram base 0xA04000 */
 #define MCU_CMD      (0xBD00 - 0x4000)   /* command from CPU        */
@@ -251,22 +252,43 @@ int input_joytest(void) {
     return 0;
 }
 
-/* Any connected pad contributes; first non-neutral wins for the axes. */
+/* Any connected pad contributes; first non-neutral wins for the axes. A VR
+ * headset's motion controllers (--vr) are one more pad: eng_xr_get_pad gives
+ * them in the same SDL layout (engine/eng_xr.h), false while there is no
+ * session, it is not focused, or the menu has the controllers. */
 static int pad_button(SDL_GameControllerButton b) {
     for (int i = 0; i < MAX_PADS; i++)
         if (pads[i] && SDL_GameControllerGetButton(pads[i], b)) return 1;
+    eng_xr_pad xp;
+    return eng_xr_get_pad(&xp) && (xp.buttons & (1u << b)) != 0;
+}
+/* deadzone, then rescale what is left to the full range so the output
+ * starts at 0 at the deadzone edge instead of jumping to ~24% */
+static int stick_deadzone(int v) {
+    if (v > 8000)  return  (int)(((long)(v - 8000) * 32767) / (32767 - 8000));
+    if (v < -8000) return -(int)(((long)(-v - 8000) * 32767) / (32768 - 8000));
     return 0;
 }
 static int pad_axis(SDL_GameControllerAxis a) {
     for (int i = 0; i < MAX_PADS; i++) {
         if (!pads[i]) continue;
-        int v = SDL_GameControllerGetAxis(pads[i], a);
-        /* deadzone, then rescale what is left to the full range so the output
-         * starts at 0 at the deadzone edge instead of jumping to ~24% */
-        if (v > 8000)  return  (int)(((long)(v - 8000) * 32767) / (32767 - 8000));
-        if (v < -8000) return -(int)(((long)(-v - 8000) * 32767) / (32768 - 8000));
+        int v = stick_deadzone(SDL_GameControllerGetAxis(pads[i], a));
+        if (v) return v;
     }
-    return 0;
+    eng_xr_pad xp;
+    return eng_xr_get_pad(&xp) ? stick_deadzone(xp.axis[a]) : 0;
+}
+/* a trigger, 0..32767: the furthest pulled of every pad's */
+static int pad_trigger(SDL_GameControllerAxis a) {
+    int best = 0;
+    for (int i = 0; i < MAX_PADS; i++) {
+        if (!pads[i]) continue;
+        int v = SDL_GameControllerGetAxis(pads[i], a);
+        if (v > best) best = v;
+    }
+    eng_xr_pad xp;
+    if (eng_xr_get_pad(&xp) && xp.axis[a] > best) best = xp.axis[a];
+    return best;
 }
 
 /* A coin switch is momentary. Holding the key must not read as a coin held
@@ -513,13 +535,9 @@ void input_pausecam_update(void)
     yaw   += pad_axis(SDL_CONTROLLER_AXIS_LEFTX)  / 32767.0f;
     pitch += pad_axis(SDL_CONTROLLER_AXIS_LEFTY)  / 32767.0f;   /* stick up (negative) raises it */
     dolly += pad_axis(SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
-    for (int i = 0; i < MAX_PADS; i++) {
-        if (!pads[i]) continue;
-        int lt = SDL_GameControllerGetAxis(pads[i], SDL_CONTROLLER_AXIS_TRIGGERLEFT);
-        int rt = SDL_GameControllerGetAxis(pads[i], SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-        if (lt > 3000) dolly += lt / 32767.0f;     /* LT: back out */
-        if (rt > 3000) dolly -= rt / 32767.0f;     /* RT: move in */
-    }
+    { int lt = pad_trigger(SDL_CONTROLLER_AXIS_TRIGGERLEFT), rt = pad_trigger(SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+      if (lt > 3000) dolly += lt / 32767.0f;       /* LT: back out */
+      if (rt > 3000) dolly -= rt / 32767.0f; }     /* RT: move in */
     g_pausecam_yaw += yaw * ORBIT;
     if (g_pausecam_yaw >  180.0f) g_pausecam_yaw -= 360.0f;
     if (g_pausecam_yaw < -180.0f) g_pausecam_yaw += 360.0f;
@@ -848,12 +866,7 @@ void input_poll(void) {
 
     /* PEDAL. Keyboard ramps the level; a pad TRIGGER sets it directly, which
      * is the closest thing a controller has to pedalling harder. */
-    { int trig = 0;
-      for (int i = 0; i < MAX_PADS; i++) {
-          if (!pads[i]) continue;
-          int v = SDL_GameControllerGetAxis(pads[i], SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-          if (v > trig) trig = v;
-      }
+    { int trig = pad_trigger(SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
       { int rp = raw_pedal(); if (rp > trig) trig = rp; }
       int analog = trig > 3000 ? (trig * PEDAL_LEVEL_MAX) / 32767 : 0;
 

@@ -155,6 +155,9 @@ static const ss22_game game = {
     .presses = presses, .n_presses = (int)(sizeof presses / sizeof *presses),
     .autoplay = autoplay,
     .pedal_full = { 0x100, 0x100 },
+    .units_per_m = 3300,                /* the tanks (the player's and an enemy's, view-space points of one battle frame): the hull 24 000 units long and
+                                         * 11 900 wide, 31 800 with the gun -- a Type 90's 7.5 x 3.4 m, 9.8 m; the camera rides 10 500 above the road, ~3 m */
+    .hfov_deg = 65.0f,                  /* the battle view's focal length, 502.3 px: 2 atan(320 / 502.3) */
 };
 
 int main(int argc, char **argv) { return ss22_main(argc, argv, &game); }

@@ -759,20 +759,25 @@ void ss22_input_update(void)
     for (int i = 0; i < 2; i++)
         pedal[i] = ramp(pedal[i], pk[i] ? (unsigned)game->pedal_max[i] : 0, (unsigned)game->pedal_step);
 
-    /* Standard gamepads: a stick out of its deadzone steers, and wins over the keys. */
+    /* Standard gamepads: a stick out of its deadzone steers, and wins over the keys. The slot after the real ones is a headset's two
+     * motion controllers as one pad (engine/eng_xr.h eng_xr_get_pad: a game that is not a light gun). */
     bool stick = false;
     unsigned stick_wheel = centre;
-    for (int i = 0; i < MAX_DEV; i++) {
-        SDL_GameController *c = pads[i].gc;
-        if (!c) continue;
-        const int lx = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
+    eng_xr_pad xp;
+    const bool xr_pad = eng_xr_get_pad(&xp);
+    for (int i = 0; i <= MAX_DEV; i++) {
+        SDL_GameController *c = i < MAX_DEV ? pads[i].gc : NULL;
+        if (i < MAX_DEV ? !c : !xr_pad) continue;
+#define PAD_AXIS(a)   (c ? SDL_GameControllerGetAxis(c, a) : xp.axis[a])
+#define PAD_BUTTON(b) (c ? SDL_GameControllerGetButton(c, b) != 0 : (xp.buttons >> (b) & 1u) != 0)
+        const int lx = PAD_AXIS(SDL_CONTROLLER_AXIS_LEFTX);
         if (lx > PAD_DEADZONE || lx < -PAD_DEADZONE) {
             const double t = pow(((lx < 0 ? -lx : lx) - PAD_DEADZONE) / (32767.0 - PAD_DEADZONE), steer_levels[steer_level].curve);
             stick_wheel = (unsigned)((int)centre + (lx < 0 ? -1 : 1) * (int)(t * game->wheel_key_span));
             stick = true;
         }
-        const int rt = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-        const int lt = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+        const int rt = PAD_AXIS(SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+        const int lt = PAD_AXIS(SDL_CONTROLLER_AXIS_TRIGGERLEFT);
         if (rt > 2000) {
             const unsigned v = (unsigned)((double)rt * game->pedal_max[0] / 32767);
             if (v > pedal[0]) pedal[0] = v;
@@ -785,8 +790,10 @@ void ss22_input_update(void)
             const ss22_action *ac = &game->actions[a];
             if (!ac->bit || !ac->pad || ac->bit == game->test_bit) continue;
             for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX; b++)
-                if ((ac->pad >> b & 1u) && SDL_GameControllerGetButton(c, (SDL_GameControllerButton)b)) { p |= ac->bit; break; }
+                if ((ac->pad >> b & 1u) && PAD_BUTTON((SDL_GameControllerButton)b)) { p |= ac->bit; break; }
         }
+#undef PAD_AXIS
+#undef PAD_BUTTON
     }
 
     { static bool stick_drove;

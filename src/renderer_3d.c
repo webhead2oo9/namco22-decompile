@@ -388,6 +388,23 @@ int g_cmd_word = 0;
 int g_cmd_mode = 0;
 int cur_priority_pub = 0;
 
+/* STEREO (--vr, engine/eng_xr.h): the eye the next renderer3d_render_frame()
+ * draws, or NULL for the game's own camera. main.c renders the frame once per
+ * eye -- the walk only READS the command list, polygon RAM and the point ROM,
+ * so walking it twice changes nothing the game sees; what does run per call is
+ * the renderer's own per-frame bookkeeping (texture and text caches, which hit
+ * on the second call, the pickers, which rebuild the same lists, and the pause
+ * camera's pivot, taken BEFORE the eye moves it, so both eyes agree on it).
+ * The frame-level diagnostics (blinklog, the distance dump's header) run once
+ * per game frame; the per-placement censuses count both eyes in a VR run.
+ * Only the WORLD sees the eye: a full-frame viewport (slave_list.c's test of
+ * one), not the HUD's screen-space group nor a plain viewport (results plates,
+ * stamps, the name-entry lens), which stay flat ON the virtual screen like the
+ * text and sprite layers. framedump.c's walk takes the same eye. */
+static eng_eye *g_eye;
+void renderer3d_set_eye(eng_eye *e) { g_eye = e; }
+eng_eye *renderer3d_eye(void) { return g_eye; }
+
 /* ========== Helpers ========== */
 
 static float dspfixed_to_float(int32_t val) {
@@ -3198,6 +3215,16 @@ static void render_object_hw_rot(int code, float px, float py, float pz,
       } }
     rigview_orbit(&gv, code + 0x45);       /* rig viewer only; no-op otherwise */
     pausecam_apply(&gv, code + 0x45);      /* pause camera; no-op unless paused */
+    /* STEREO: the eye being drawn (renderer3d_set_eye), after the pause camera
+     * so the eye sits beside whatever camera the player is looking through. A
+     * placement with no clip window is drawn over the whole screen; one with a
+     * window counts when the window covers it (slave_list.c's test). */
+    if (g_eye && !hud_screen_space(code) && !plain_viewport()) {
+        const int32_t cx = 320 + gv.vx;
+        if (!gv.have_clip || ((int32_t)((float)cx + gv.cl) <= 0 && (int32_t)((float)cx - gv.cr - 1.0f) >= 639)) {
+            eng_eye_view(g_eye, &gv, (float)gv.zoom_mant / (float)(1u << gv.zoom_shift));
+        }
+    }
     geo_hw_set_view(&gv);
     /* The point-ROM object code is the CPU list's model id PLUS 0x45.
      * pc_master_model.py documents the emitted record as
@@ -4461,9 +4488,14 @@ void renderer3d_process_dsp_commands(void) {
 }
 
 void renderer3d_render_frame(void) {
-    { extern int g_bn; g_bn = 0; }   /* per-frame bbox reset */
-    { extern void blinklog_frame(unsigned); blinklog_frame(g_sys.frame_count); }
-    dist_dump_frame_header();
+    /* once per GAME frame: a VR frame renders twice, once per eye (g_eye) */
+    { static unsigned hdr_frame; static int hdr_done;
+      if (!hdr_done || hdr_frame != g_sys.frame_count) {
+          hdr_done = 1; hdr_frame = g_sys.frame_count;
+          { extern int g_bn; g_bn = 0; }   /* per-frame bbox reset */
+          { extern void blinklog_frame(unsigned); blinklog_frame(g_sys.frame_count); }
+          dist_dump_frame_header();
+      } }
     /* Model viewer mode: bypass DSP commands, render directly */
     if (viewer_model_id > 0) {
         render_viewer_model();

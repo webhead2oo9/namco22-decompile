@@ -17,6 +17,8 @@ extern int g_cfg_fullscreen, g_cfg_scale, g_cfg_scaling, g_cfg_volume;
 extern int g_cfg_winmode, g_cfg_res_w, g_cfg_res_h, g_cfg_wide, g_cfg_aspect, g_cfg_draw;
 extern char g_cfg_net_server[128], g_cfg_net_name[24];   /* the Online page's server and lobby name */
 bool rr_input_set_option(const char *path, const char *key, const char *val);
+int  rr_input_vr_get(const char *key, int def);                  /* a "vr_*" setting as loaded (the VR headset's: engine/eng_xr.h) */
+void rr_input_vr_set(const char *path, const char *key, int v);  /* set it, and save the line */
 const char *rr_input_action_name(int a);
 void rr_input_bind_key(int a, SDL_Scancode sc);
 typedef struct {

@@ -59,6 +59,14 @@ bool ui_handle_event(SDL_Event *e);
 void ui_draw(SDL_Window *win, bool *quit);
 /* File -> Restart was chosen: main() re-launches the program on exit. */
 bool ui_restart_requested(void);
+bool ui_visible(void);                            /* the menu or the hint is up: ui_draw draws something */
+
+/* ---- VR (--vr, engine/eng_xr.h) ------------------------------------------
+ * The headset's settings live in propcycl_controls.cfg (eng_xr_host's
+ * cfg_get / cfg_set); ui_vr_on() adds the VR menu once a session runs. */
+int  ui_vr_cfg_get(const char *key, int def);
+void ui_vr_cfg_set(const char *key, int v);
+void ui_vr_on(void);
 
 void ui_set_hint(const char *text, int frames);   /* a hint line at the bottom of the window while the menu is closed */
 #endif /* UI_MENU_H */

@@ -38,8 +38,9 @@ static int       qn, qcap, qorder;
 static geo_quad *qbuf_r;
 static int       qn_r, qcap_r;
 static int32_t   st_sep, st_zconv;            /* the next prepare's eyes (0 = the game's camera) */
+static float     st_fmax;                     /* their longest full-depth lens (slave_list.h eng_eye.focal_max) */
 static bool      st_frame;                    /* the prepared frame has two eyes */
-static float     st_focal;                    /* its full-frame viewport's focal length (0 = no world this frame) */
+static float     st_focal;                    /* its full-frame viewport's focal length as the parallax sees it (0 = no world this frame) */
 static void eye_swap(void)
 {
     geo_quad *b = qbuf; qbuf = qbuf_r; qbuf_r = b;
@@ -47,7 +48,7 @@ static void eye_swap(void)
     n = qcap; qcap = qcap_r; qcap_r = n;
 }
 static int32_t eye_dx(int eye) { return eye ? st_sep - st_sep / 2 : -(st_sep / 2); }   /* the pair's two halves add up to st_sep */
-void ss22_set_stereo(int32_t sep, int32_t zconv) { st_sep = sep > 0 ? sep : 0; st_zconv = zconv; }
+void ss22_set_stereo(int32_t sep, int32_t zconv, float focal_max) { st_sep = sep > 0 ? sep : 0; st_zconv = zconv; st_fmax = focal_max; }
 bool ss22_stereo_frame(void) { return st_frame; }
 
 static void push_quad(const geo_quad *q, void *user)
@@ -163,7 +164,7 @@ void ss22_prepare(const ss22_regs *r)
     qn = 0; qorder = 0; qn_r = 0;
     st_frame = st_sep > 0; st_focal = 0;
     if (r->walk) {
-        eng_eye eye[2] = { { eye_dx(0), st_zconv, 0 }, { eye_dx(1), st_zconv, 0 } };
+        eng_eye eye[2] = { { eye_dx(0), st_zconv, st_fmax, 0 }, { eye_dx(1), st_zconv, st_fmax, 0 } };
         eng_list_cfg cfg = { ENG_LIST_HEAD_SS22, 0, NULL, NULL, NULL, NULL, st_frame ? &eye[0] : NULL };
         eng_walk_list(r->poly_word, &cfg, push_quad, NULL);
         eng_quad_sort(qbuf, qn, 0);

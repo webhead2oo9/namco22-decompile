@@ -22,6 +22,8 @@ double g_perf_game, g_perf_render;
 #include "ui_menu.h"
 #include "eng_pad.h"
 #include "render_target.h"
+#include "eng_xr.h"
+#include "slave_list.h"
 #include "rom_zip.h"
 #include <signal.h>
 #ifdef _WIN32
@@ -73,6 +75,25 @@ static bool running = true;
 /* Screenshot mode */
 static bool headless = false;
 static bool no_audio = false;   /* --noaudio; see AUDIO_PLAN.md phase 1 */
+/* --vr: the game in a VR headset (engine/eng_xr.h) -- on a big virtual screen
+ * in front of the player, in stereo, the motion controllers as a pad. vr_on:
+ * its OpenXR session started (no runtime or headset: the game stays in its
+ * window and says why). */
+static bool vr_flag, vr_on;
+/* THE GAME'S SCALE for the headset, measured off the live renderer:
+ *   field of view: the world's viewport zoom word 0x780 (30 deg, renderer_3d.c
+ *     "THE FOCAL LENGTH COMES FROM THE VIEWPORT'S OWN BLOCK") is a focal length
+ *     of 554.25 px, so 2 atan(320 / 554.25) = 60.0 deg across the 4:3 picture.
+ *   units in a metre: the rider. A gameplay frame (--level 1, frame 2400,
+ *     PROPCYCL_DIST_DUMP + PROPCYCL_BBOX per rig part) puts him 9300 units in
+ *     front of the camera; his leg joints (models 86-88 / 89-91) are 236 + 291
+ *     units apart -- bicycle_ik_solve's own bone lengths 0xDD and 0x122, 511
+ *     hip to ankle -- and crown to the low pedal spans 66 px, 1108 units.
+ *     A teenage rider's 0.75 m leg gives 680, a 1.5 m seated height 740:
+ *     700 units a metre. */
+#define PC_VR_HFOV_DEG     60.0f
+#define PC_VR_UNITS_PER_M  700
+static bool vr_wide(void) { return ui_aspect() < 0.0f; }   /* the Display menu's Widescreen */
 
 /* Live-capture directory for the F12 key.  Read once at startup and never
  * from the frame loop -- see the mismatch register row 40: getenv() inside
@@ -298,6 +319,16 @@ static bool init_sdl(void) {
         setenv("SDL_VIDEODRIVER", "offscreen", 1);
 #endif
     }
+#ifndef _WIN32
+    /* --vr: OpenXR's OpenGL on Linux is GLX's (XWayland on a Wayland desktop) */
+    if (vr_flag && !headless && !getenv("SDL_VIDEODRIVER")) {
+#ifdef SDL_HINT_VIDEODRIVER
+        SDL_SetHint(SDL_HINT_VIDEODRIVER, "x11");
+#else
+        setenv("SDL_VIDEODRIVER", "x11", 1);
+#endif
+    }
+#endif
 
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -347,7 +378,11 @@ static bool init_sdl(void) {
         /* PROPCYCL_WINDOW=<w>x<h>: the starting window size, e.g. to check
          * the resolution scaler against a 16:9 window without a desktop */
         { const char *e = getenv("PROPCYCL_WINDOW"); int w, h;
-          if (e && sscanf(e, "%dx%d", &w, &h) == 2 && w >= 160 && h >= 120) { win_w = w; win_h = h; } }
+          if (e && sscanf(e, "%dx%d", &w, &h) == 2 && w >= 160 && h >= 120) { win_w = w; win_h = h; }
+          /* --vr: the game's own 640 x 480. The menu lays itself out in the
+           * window's points and the headset spreads the window over the
+           * whole virtual screen, so a 2x window would halve the menu there. */
+          else if (vr_flag) { win_w = SCREEN_WIDTH; win_h = SCREEN_HEIGHT; } }
         flags |= SDL_WINDOW_RESIZABLE;
     }
     window = SDL_CreateWindow("Prop Cycle",
@@ -497,6 +532,110 @@ static void on_signal_quit(int sig) {
     running = false;
 }
 
+/* A captured polygon-RAM dump contains ONLY 3D geometry -- no sprite list,
+ * no text layer. Drawing the 2D layer during framedump playback therefore
+ * composites whatever stale state the game loop happens to hold, which is
+ * where the stray Japanese glyphs came from: the sprite path resolves ids
+ * 0x14A-0x151 as raw 32x32 tiles and those land in the Japanese font region
+ * of the sprite ROM (tools/l3/BASELINE.md, title-logo pass). The reference
+ * rasteriser draws 3D only, so this also makes our output directly
+ * comparable. PROPCYCL_FORCE_2D=1 puts it back for debugging.
+ *
+ * Skip the legacy renderer_2d layer whenever something better is already
+ * drawing 2D:
+ *   - a framedump replay (a capture has no live sprite/text state, so this
+ *     would composite stale game RAM),
+ *   - the map viewer (a geometry inspector -- the stray Japanese glyphs over
+ *     the map were this path drawing a text RAM the game never filled),
+ *   - and the LIVE GAME once sprite_hw/text_hw have live state.
+ *
+ * That last case is why live gameplay looked wrecked: BOTH 2D paths were
+ * running. text_hw/sprite_hw are pixel-exact ports (100.00% against their
+ * reference models) and already draw the text layer live; renderer_2d then
+ * painted over the result with the magenta blocks of its known-broken
+ * fade/composite, plus sprite ids resolved as raw 32x32 tiles that land in
+ * the Japanese font region of the sprite ROM -- the stray glyphs.
+ * PROPCYCL_FORCE_2D=1 still forces the legacy layer back on.
+ * (After renderer3d_render_frame, which decides renderer3d_live_2d_ok.) */
+static void draw_2d_layers(void)
+{
+    int fd_mode = ((framedump_path != NULL) || ui_map_active() ||
+                   renderer3d_live_2d_ok()) &&
+                  (getenv("PROPCYCL_FORCE_2D") == NULL);
+    if (!fd_mode) {
+        if (getenv("PROPCYCL_NO_2D") == NULL) renderer2d_draw_tilemap();
+        renderer2d_composite();
+    }
+}
+
+/* ---- the headset (--vr) ---------------------------------------------------
+ * One picture per eye: the whole frame -- 3D, sprites, text, the legacy 2D --
+ * rendered again with the eye beside the game's camera (renderer_3d.c
+ * renderer3d_set_eye: the world only; the HUD and the 2D layers are the same
+ * in both eyes, ON the virtual screen). The game state is not touched: the
+ * renderer only reads it (see renderer3d_set_eye). eye 0 is the left one, at
+ * -sep/2; the pair's halves add up to sep; a lens longer than focal_max moves
+ * them in (engine/slave_list.h eng_eye). */
+typedef struct { int32_t sep, zconv; float focal_max; } pc_stereo;
+static pc_stereo stereo_shot;                 /* PROPCYCL_STEREO_SHOTS */
+static void draw_eye_layers(int eye, const pc_stereo *st)
+{
+    extern void renderer3d_set_eye(eng_eye *e);
+    eng_eye e = { eye ? st->sep - st->sep / 2 : -(st->sep / 2), st->zconv, st->focal_max, 0.0f };
+    renderer3d_set_eye(st->sep > 0 ? &e : NULL);
+    if (getenv("PROPCYCL_NO_3D") == NULL) { double _t=perf_now(); renderer3d_render_frame(); g_perf_render += perf_now()-_t; }
+    renderer3d_set_eye(NULL);
+    draw_2d_layers();
+}
+/* eng_xr_present's callbacks: one eye into its bound picture, w x h, the
+ * viewport set -- black round the picture like the window, the 3D widened to
+ * the picture's shape when it is widescreen (vr_wide: eng_xr makes it 16:9) */
+static void vr_draw_eye(int eye, int w, int h, void *u)
+{
+    const pc_stereo *st = u;
+    extern float g_scene_x0, g_scene_x1;
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    g_scene_x0 = 0.0f; g_scene_x1 = (float)SCREEN_WIDTH;
+    { const int E = (int)(((float)SCREEN_HEIGHT * w / (h > 0 ? h : 1) - SCREEN_WIDTH) / 2.0f + 0.5f);
+      if (E > 0) { g_scene_x0 = (float)-E; g_scene_x1 = (float)(SCREEN_WIDTH + E); } }
+    draw_eye_layers(eye, st);
+}
+static void vr_draw_menu(void *u)
+{
+    (void)u;
+    bool quit = false;
+    ui_draw(window, &quit);
+    if (quit) running = false;
+}
+static void vr_present(void)
+{
+    pc_stereo st = { 0, 0, 0.0f };
+    eng_xr_stereo(&st.sep, &st.zconv, &st.focal_max);
+    eng_xr_present(window, vr_draw_eye, vr_draw_menu, ui_visible(), &st, false, NULL);
+}
+/* The headset paces what it shows (xrWaitFrame); the game keeps its own
+ * 59.906 Hz on a timer -- the window's vsync is off in VR, it would tie the
+ * game to the desktop's refresh. Sleep to the frame, the last millisecond
+ * spun; a stall resyncs instead of bursting to catch up. */
+static uint64_t vr_now_ns(void)   /* split the scaling: counter * 1e9 overflows 64 bits */
+{
+    const uint64_t c = SDL_GetPerformanceCounter(), f = SDL_GetPerformanceFrequency();
+    return c / f * 1000000000ull + c % f * 1000000000ull / f;
+}
+static void vr_pace(void)
+{
+    static uint64_t next;
+    const uint64_t now = vr_now_ns();
+    next = next ? next + 16693000ull : now + 16693000ull;   /* 1 / 59.906 Hz */
+    if (next > now) {
+        const uint64_t left = next - now;
+        if (left > 2000000ull) SDL_Delay((Uint32)((left - 1500000ull) / 1000000ull));
+        while (vr_now_ns() < next) ;
+    } else if (now - next > 100000000ull) next = now;
+}
+
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     /* Double-clicked, or started from a shortcut: work from the program's own
@@ -547,6 +686,8 @@ int main(int argc, char* argv[]) {
             return pedal_enctest();
         } else if (strcmp(argv[i], "--noaudio") == 0) {
             no_audio = true;
+        } else if (strcmp(argv[i], "--vr") == 0) {
+            vr_flag = true;
         } else if (strcmp(argv[i], "--screenshot") == 0) {
             headless = true;
             if (i + 1 < argc && argv[i+1][0] != '-')
@@ -674,6 +815,22 @@ int main(int argc, char* argv[]) {
     /* Init subsystems */
     ui_init(window);   /* also in headless, so screenshots can show the menu */
     if (!headless && eng_pad_present()) ui_set_hint(ENG_PAD_MENU_HINT, 60 * 8);   /* a pad has no Esc: say how to reach the menu */
+    /* --vr: an OpenXR session sharing the window's GL context. The headset's
+     * xrWaitFrame paces what it shows, so the game runs on a timer at its own
+     * rate (vr_pace) instead of the window's vsync. */
+    if (vr_flag && !headless) {
+        const eng_xr_host xh = { "Prop Cycle", PC_VR_UNITS_PER_M, PC_VR_HFOV_DEG, false, vr_wide, ui_is_open,
+                                 ui_vr_cfg_get, ui_vr_cfg_set };
+        vr_on = eng_xr_start(&xh);
+        if (vr_on) { SDL_GL_SetSwapInterval(0); ui_vr_on(); ui_set_hint(ENG_XR_MENU_HINT, 60 * 8); }
+        else fprintf(stderr, "[HOST] no VR: playing in the window\n");
+    }
+    /* PROPCYCL_STEREO_SHOTS=<sep>:<zconv>[:<focal_max>] (tests; the game's
+     * units; no focal_max = no limit): the --screenshot frame is also written
+     * once per eye, <name>_L.ppm and <name>_R.ppm, the two pictures a headset
+     * gets (vr_draw_eye) */
+    { const char *e = getenv("PROPCYCL_STEREO_SHOTS");
+      if (e) sscanf(e, "%d:%d:%f", &stereo_shot.sep, &stereo_shot.zconv, &stereo_shot.focal_max); }
     { extern int g_bbox_code; const char *e = getenv("PROPCYCL_BBOX");
       if (e) g_bbox_code = atoi(e); }
     { extern int g_zord_on; g_zord_on = getenv("PROPCYCL_ZORD") ? 1 : 0; }
@@ -1051,6 +1208,18 @@ int main(int argc, char* argv[]) {
         }
         if (!headless) {
             SDL_Event ev;
+            /* the headset's session and controllers, before the events: while
+             * the menu is open its pointer arrives as SDL mouse events. The
+             * menu button opens the menu; with it open, back (B / Y / the menu
+             * button again) closes it -- the menu bar has no keyboard steps. */
+            if (vr_on) {
+                eng_xr_poll();
+                for (char c; (c = eng_xr_menu_key()) != 0; )
+                    if ((c == 'm' && !ui_is_open()) || (c == 'b' && ui_is_open())) {
+                        ui_toggle();
+                        fprintf(stderr, "[HOST] menu %s (VR)\n", ui_is_open() ? "open" : "closed");
+                    }
+            }
             ui_input_begin();
             while (SDL_PollEvent(&ev)) {
                 if (ev.type == SDL_QUIT) running = false;
@@ -1577,7 +1746,9 @@ int main(int argc, char* argv[]) {
         /* Viewport: honour the chosen aspect. The scene is a fixed 640x480,
          * so a non-4:3 window either stretches it or gets bars. Clear the
          * whole window black first so the bars are bars, not stale pixels. */
-        if (!headless) {
+        /* --vr with a live session: the eyes are drawn later, in vr_present */
+        const bool vr_live = vr_on && eng_xr_running();
+        if (!headless && !vr_live) {
             /* DRAWABLE pixels, not window units: on a scaled (HiDPI /
              * Wayland fractional) desktop they differ, and a viewport in
              * window units covered only part of the picture. */
@@ -1612,7 +1783,7 @@ int main(int argc, char* argv[]) {
                 glViewport((ww - vw) / 2, (wh - vh) / 2, vw, vh);
             }
         }
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        if (!vr_live) glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         /* PROPCYCL_NO_3D / PROPCYCL_NO_2D: isolate a layer. Added because a
          * blank-looking frame cannot tell you WHICH layer failed, and the
@@ -1685,7 +1856,7 @@ int main(int argc, char* argv[]) {
                 shown++;
             }
         }
-        if (getenv("PROPCYCL_NO_3D") == NULL) { double _t=perf_now(); renderer3d_render_frame(); g_perf_render += perf_now()-_t; }
+        if (!vr_live && getenv("PROPCYCL_NO_3D") == NULL) { double _t=perf_now(); renderer3d_render_frame(); g_perf_render += perf_now()-_t; }
         /* PROPCYCL_PERFFRAME=<ms>: log every frame slower than <ms>, with the
          * phase split, so a stutter can be attributed instead of guessed at. */
         { static double _pf = -1; static double _lastg, _lastr, _lastp, _lastf, _lastx;
@@ -1705,44 +1876,13 @@ int main(int argc, char* argv[]) {
               _lastg=g_perf_game; _lastr=g_perf_render; _lastp=g_perf_pdp;
               _lastf=g_perf_flush; _lastx=g_perf_txt;
           } }
-        /* A captured polygon-RAM dump contains ONLY 3D geometry -- no
-         * sprite list, no text layer. Drawing the 2D layer during framedump
-         * playback therefore composites whatever stale state the game loop
-         * happens to hold, which is where the stray Japanese glyphs came
-         * from: the sprite path resolves ids 0x14A-0x151 as raw 32x32 tiles
-         * and those land in the Japanese font region of the sprite ROM
-         * (tools/l3/BASELINE.md, title-logo pass). The reference rasteriser
-         * draws 3D only, so this also makes our output directly comparable.
-         * PROPCYCL_FORCE_2D=1 puts it back for debugging. */
-        /* Skip the legacy renderer_2d layer whenever something better is
-         * already drawing 2D:
-         *   - a framedump replay (a capture has no live sprite/text state,
-         *     so this would composite stale game RAM),
-         *   - the map viewer (a geometry inspector -- the stray Japanese
-         *     glyphs over the map were this path drawing a text RAM the
-         *     game never filled),
-         *   - and the LIVE GAME once sprite_hw/text_hw have live state.
-         *
-         * That last case is why live gameplay looked wrecked: BOTH 2D
-         * paths were running. text_hw/sprite_hw are pixel-exact ports
-         * (100.00% against their reference models) and already draw the
-         * text layer live; renderer_2d then painted over the result with
-         * the magenta blocks of its known-broken fade/composite, plus
-         * sprite ids resolved as raw 32x32 tiles that land in the
-         * Japanese font region of the sprite ROM -- the stray glyphs.
-         * PROPCYCL_FORCE_2D=1 still forces the legacy layer back on. */
-        int fd_mode = ((framedump_path != NULL) || ui_map_active() ||
-                       renderer3d_live_2d_ok()) &&
-                      (getenv("PROPCYCL_FORCE_2D") == NULL);
-        if (!fd_mode) {
-            if (getenv("PROPCYCL_NO_2D") == NULL) renderer2d_draw_tilemap();
-            renderer2d_composite();
-        }
+        if (!vr_live) draw_2d_layers();
 
         /* the frame is finished: scale it from the render target into the window */
-        if (!headless) rt_end(window, ui_aspect() == 0.0f);
+        if (!headless && !vr_live) rt_end(window, ui_aspect() == 0.0f);
 
-        {
+        if (vr_live) vr_present();   /* both eyes into the headset, the menu over them; the window mirrors the left eye */
+        else {
             /* LAST: the Nuklear backend saves/restores GL state around its
              * own draw, so anything after it would be fighting that. */
             bool ui_quit = false;
@@ -1851,6 +1991,7 @@ int main(int argc, char* argv[]) {
         if (!headless) SDL_GL_SwapWindow(window);
         else if (headless)
             glFinish();  /* ensure rendering completes */
+        if (vr_on) vr_pace();
 
         g_sys.frame_count++;
 
@@ -1892,6 +2033,14 @@ int main(int argc, char* argv[]) {
                   printf("  [BBOX] code=%d verts=%d screen x[%d..%d] w=%d  y[%d..%d] h=%d\n",
                          g_bbox_code, g_bn, g_bx0, g_bx1, g_bx1-g_bx0, g_by0, g_by1, g_by1-g_by0); }
             save_screenshot(screenshot_path);
+            if (stereo_shot.sep > 0)                  /* PROPCYCL_STEREO_SHOTS: the same frame, once per eye */
+                for (int eye = 0; eye < 2; eye++) {
+                    char p[1024]; const size_t n = strlen(screenshot_path);
+                    snprintf(p, sizeof p, "%.*s_%c.ppm", (int)(n > 4 ? n - 4 : n), screenshot_path, eye ? 'R' : 'L');
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                    draw_eye_layers(eye, &stereo_shot);
+                    save_screenshot(p);
+                }
 
             /* Dump DSP command buffer for scene analysis */
             {
@@ -1912,6 +2061,7 @@ int main(int argc, char* argv[]) {
     }
 
     trace_finish();
+    if (vr_on) eng_xr_stop();   /* while its GL context is still there */
     SDL_GL_DeleteContext(glctx);
     SDL_DestroyWindow(window);
     { extern double g_perf_w2r, g_perf_r2w, g_perf_fog;

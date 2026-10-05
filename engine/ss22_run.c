@@ -448,7 +448,7 @@ int ss22_main(int argc, char **argv, const ss22_game *g)
     extern bool ss22_input_aim(float *, float *);
     host_game = (ss22_host_game){ g->name, cfgfile, g->tag, g->lname, in_init, ss22_input_page, ss22_input_event, in_update,
                                   ss22_input_neutral, ss22_snd_set_output, g->out_gain,
-                                  g->input && g->input->light_gun ? ss22_input_aim : NULL, g->menu_page, g->units_per_m };
+                                  g->input && g->input->light_gun ? ss22_input_aim : NULL, g->menu_page, g->units_per_m, g->hfov_deg };
     const char *rom_dir = "extracted";
     const char *rd_dir = NULL, *rd_out = NULL; int rd_frame = 0, frames_given = 0;
     if (argc == 1) win_scale = -1;                      /* started with no arguments (a double-click, the Windows how-to): play, in a window */
@@ -456,7 +456,10 @@ int ss22_main(int argc, char **argv, const ss22_game *g)
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) { max_frames = (uint32_t)atoi(argv[++i]); frames_given = 1; }
         else if (!strcmp(argv[i], "--window")) { win_scale = (i + 1 < argc && atoi(argv[i + 1]) > 0) ? atoi(argv[++i]) : -1; }   /* -1: the saved size */
         else if (!strcmp(argv[i], "--fullscreen")) { win_full = 1; if (!win_scale) win_scale = -1; }
-        else if (!strcmp(argv[i], "--vr")) { vr = 1; if (!win_scale) win_scale = -1; }          /* a headset: a window too (it shows the left eye) */
+        else if (!strcmp(argv[i], "--vr")) { vr = 1; if (!win_scale) win_scale = 1; }           /* a headset: a window too (it shows the left eye), 1x unless
+                                                                                                  * --window says otherwise: the menu lays itself out in the window, and
+                                                                                                  * the headset spreads the window over its screen -- a 640-point window
+                                                                                                  * makes it legible there. Not saved (eng_disp_load) */
         else if (!strcmp(argv[i], "--shots") && i + 2 < argc) { shot_dir = argv[++i]; shot_every = atoi(argv[++i]); if (shot_every < 1) shot_every = 1; }
         else if (!strcmp(argv[i], "--render-dump") && i + 3 < argc) { rd_dir = argv[++i]; rd_frame = atoi(argv[++i]); rd_out = argv[++i]; }
         else if (!strcmp(argv[i], "--ppf") && i + 1 < argc) polls_per_frame = atoi(argv[++i]);

@@ -36,6 +36,25 @@ int g_cfg_draw = 0;          /* draw distance level 0..3 (rr_host_set_draw) */
 int g_cfg_winmode = -1, g_cfg_res_w = 640, g_cfg_res_h = 480, g_cfg_wide = 0, g_cfg_aspect = 1;   /* scaling: 0 smooth, 1 sharp, 2 integer */            /* free_play = 0|1 in rr_controls.cfg; -1 = not set */
 int g_pad_deadzone = 8000;          /* of 32767; a real Xbox One pad here rests at 3019 */
 char g_cfg_net_server[128] = "zonesync.net", g_cfg_net_name[24];   /* net_server / net_name in rr_controls.cfg (the Online page) */
+/* the VR headset's settings (engine/eng_xr.h: vr_distance_cm, vr_size, vr_depth): integers under their own "vr_*" keys in
+ * rr_controls.cfg, kept here as read and handed to eng_xr through rr_input_vr_get / rr_input_vr_set */
+#define VR_KEYS 8
+static struct { char key[32]; int v; } vr_cfg[VR_KEYS];
+static int vr_n;
+static int vr_find(const char *key) { for (int i = 0; i < vr_n; i++) if (!strcmp(vr_cfg[i].key, key)) return i; return -1; }
+static void vr_put(const char *key, int v)
+{
+    int i = vr_find(key);
+    if (i < 0 && vr_n < VR_KEYS) { i = vr_n++; snprintf(vr_cfg[i].key, sizeof vr_cfg[i].key, "%s", key); }
+    if (i >= 0) vr_cfg[i].v = v;
+}
+int rr_input_vr_get(const char *key, int def) { const int i = vr_find(key); return i < 0 ? def : vr_cfg[i].v; }
+void rr_input_vr_set(const char *path, const char *key, int v)
+{
+    char s[16]; snprintf(s, sizeof s, "%d", v);
+    vr_put(key, v);
+    rr_input_set_option(path, key, s);
+}
 
 /* Raw joysticks: devices SDL does not know as a gamepad (wheels, pedals,
  * arcade sticks). Axes and buttons are mapped by number -- find the numbers
@@ -110,6 +129,7 @@ void rr_input_load(const char *path)
         if (!strcmp(k, "steer_speed")) { g_steer_speed = atoi(v); continue; }
         if (!strcmp(k, "steer_return")) { g_steer_return = atoi(v); continue; }
         if (!strcmp(k, "pad_deadzone")) { g_pad_deadzone = atoi(v); continue; }
+        if (!strncmp(k, "vr_", 3)) { vr_put(k, atoi(v)); continue; }
         if (!strcmp(k, "free_play")) { g_cfg_freeplay = atoi(v) ? 1 : 0; continue; }
         if (!strcmp(k, "ffb_strength")) { int x = atoi(v); g_cfg_ffb_strength = x < 0 ? 0 : x > 100 ? 100 : x; continue; }
         if (!strcmp(k, "ffb_invert")) { g_cfg_ffb_invert = atoi(v) ? 1 : 0; continue; }

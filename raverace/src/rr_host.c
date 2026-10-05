@@ -38,6 +38,7 @@
 #include "render_target.h"
 #include "eng_gl.h"
 #include "gl_warn.h"
+#include "eng_xr.h"
 extern int g_rr_gl;     /* rr_main.c: 1 = the engine's GL renderer, 0 = the software oracle */
 
 /* ---- controllers ----------------------------------------------------------
@@ -98,6 +99,22 @@ static void out_size(int *w, int *h)   /* the window's drawable, in pixels */
 }
 static uint64_t next_ns;
 static bool vsync;                    /* presenting paces us (display ~60 Hz) */
+/* --vr: an OpenXR session shares the window's GL context (engine/eng_xr.h). The headset shows the picture on a big virtual screen,
+ * each eye from its own walk of the list (src/rr_gl.c rr_gl_set_stereo); the window mirrors the left eye. The board's 59.906 Hz
+ * timer paces the game (vsync off), xrWaitFrame paces the headset. */
+static bool xr_on;
+/* the game's scale for the headset, measured on the attract replay at frame 1800 (RR_STEREO_SHOTS logs the focal length; the rival's
+ * quads from RR_CLIPLOG_BOX, their view-space depths read off the walk's geo_quad.rv[].z): the race's full-frame viewport has a
+ * focal length of 554.2 px, so 2 atan(320 / 554.2) = 60 degrees across the 4:3 picture; the red rival
+ * there (a Supra, 1.81 m wide) spans 143 px at 9 700 - 10 500 units deep, about 2 500 units -- 1 400 units to the metre */
+#define RR_XR_UNITS_PER_M 1400
+#define RR_XR_HFOV_DEG    60.0f
+static bool xr_wide(void) { return g_cfg_wide != 0; }
+static int  xr_cfg_get(const char *key, int def) { return rr_input_vr_get(key, def); }
+static void xr_cfg_set(const char *key, int v) { rr_input_vr_set("rr_controls.cfg", key, v); }
+/* this frame's headset pad (engine/eng_xr.h eng_xr_get_pad): the two controllers in a game pad's layout, read where the real pads are */
+static eng_xr_pad xpad;
+static bool xpad_ok;
 /* the board: PIXEL_CLOCK 25.6 MHz / (HTOTAL 814 x VTOTAL 525) = 59.906 Hz */
 #define FRAME_NS 16692969ull
 static uint64_t now_ns(void)          /* split the scaling: counter * 1e9 overflows 64 bits */
@@ -315,13 +332,21 @@ static void apply_fullscreen(void)
 }
 static void save_opt(const char *k, const char *v) { rr_input_set_option("rr_controls.cfg", k, v); }
 
-bool rr_host_open(int scale)
+bool rr_host_open(int scale, bool vr)
 {
     rr_input_load("rr_controls.cfg");
+    /* VR: the menu lays itself out in the WINDOW's points and the headset spreads the window over its whole virtual screen, so a big
+     * window makes the menu small there -- the game's own 640 x 480, in a window, unless --window N / --fullscreen asked otherwise
+     * (for this run only: nothing here is saved) */
+    if (vr && scale <= 0) scale = 1;
     if (scale > 0) g_cfg_scale = scale;                /* --window N overrides the saved size */
     if (getenv("RR_FULLSCREEN")) { g_cfg_fullscreen = atoi(getenv("RR_FULLSCREEN")) != 0; g_cfg_winmode = g_cfg_fullscreen; }
+    else if (vr) g_cfg_winmode = 0;
     if (g_cfg_winmode < 0) g_cfg_winmode = g_cfg_fullscreen ? 1 : 0;
     g_cfg_fullscreen = g_cfg_winmode != 0;
+#ifndef _WIN32
+    if (vr && !getenv("SDL_VIDEODRIVER")) SDL_SetHint(SDL_HINT_VIDEODRIVER, "x11");   /* OpenXR's OpenGL on Linux is GLX's (XWayland on a Wayland desktop) */
+#endif
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     eng_ffb_start();                                 /* before the joysticks, or Windows never lists a wheel as haptic (engine/eng_ffb.h) */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) { fprintf(stderr, "[HOST] SDL: %s\n", SDL_GetError()); return false; }
@@ -364,7 +389,14 @@ bool rr_host_open(int scale)
 
     tex_w = 640; tex_h = 480;
     { extern int g_rr_draw_extra; g_rr_draw_extra = draw_extra[g_cfg_draw < 0 ? 0 : g_cfg_draw > 3 ? 3 : g_cfg_draw]; }
+    if (vr) {                                        /* the headset: the window shows the left eye, the timer paces the game (xrWaitFrame paces the headset) */
+        const eng_xr_host xh = { "Rave Racer", RR_XR_UNITS_PER_M, RR_XR_HFOV_DEG, false, xr_wide, rr_ui_is_open, xr_cfg_get, xr_cfg_set };
+        xr_on = eng_xr_start(&xh);
+        if (xr_on) { vsync = false; SDL_GL_SetSwapInterval(0); rr_ui_set_vr(true); }
+        else fprintf(stderr, "[HOST] no VR: playing in the window\n");
+    }
     if (!rr_ui_init(win)) fprintf(stderr, "[HOST] menu: Nuklear init failed\n");
+    else if (xr_on) rr_ui_set_hint(ENG_XR_MENU_HINT, 60 * 8);                 /* in the headset: how to reach the menu */
     else if (eng_pad_present()) rr_ui_set_hint(ENG_PAD_MENU_HINT, 60 * 8);      /* a pad has no Esc: say how to reach the menu */
     SDL_SetWindowMinimumSize(win, 320, 240);
     if (g_cfg_winmode == 2) apply_fullscreen();                                /* exclusive: set the mode */
@@ -427,6 +459,7 @@ static bool held(int act)
         SDL_Joystick *js = dev[d].gc ? SDL_GameControllerGetJoystick(dev[d].gc) : dev[d].js;
         if (rr_input_button_matches(act, js, g_joy_button[act]) && SDL_JoystickGetButton(js, g_joy_button[act])) return true;
     }
+    if (xpad_ok && g_bind[act].pad != SDL_CONTROLLER_BUTTON_INVALID && (xpad.buttons >> g_bind[act].pad & 1u)) return true;   /* the headset's pad */
     return false;
 }
 static bool pressed(const SDL_Event *e, int act)
@@ -439,17 +472,18 @@ static bool pressed(const SDL_Event *e, int act)
 }
 
 #define WHEEL_DEADZONE 32             /* of 32767 (0.1% of the lock, 0.3 degrees of the cabinet's 270): a wheel's own sensor noise, nothing more */
-/* analog sources, strongest wins; returns false when every source is neutral */
+/* analog sources, strongest wins; returns false when every source is neutral. The slot after the real devices is a VR headset's two
+ * motion controllers as one game pad (engine/eng_xr.h eng_xr_get_pad), read like a GameController. */
 static bool pad_steer(int *out)                   /* -32767..32767 */
 {
     int best = 0;
-    for (int d = 0; d < MAX_DEV; d++) {
+    for (int d = 0; d <= MAX_DEV; d++) {
         int v = 0;
-        if (dev[d].gc) {
-            v = SDL_GameControllerGetAxis(dev[d].gc, SDL_CONTROLLER_AXIS_LEFTX);
+        if (d == MAX_DEV ? xpad_ok : dev[d].gc != NULL) {
+            v = d == MAX_DEV ? xpad.axis[SDL_CONTROLLER_AXIS_LEFTX] : SDL_GameControllerGetAxis(dev[d].gc, SDL_CONTROLLER_AXIS_LEFTX);
             if (v > -g_pad_deadzone && v < g_pad_deadzone) v = 0;
             else v = (v > 0 ? v - g_pad_deadzone : v + g_pad_deadzone) * 32767 / (32767 - g_pad_deadzone);
-        } else if (rr_input_axis_device(&g_joy_steer, dev[d].js) && g_joy_steer.axis >= 0 && g_joy_steer.axis < SDL_JoystickNumAxes(dev[d].js)) {
+        } else if (d < MAX_DEV && rr_input_axis_device(&g_joy_steer, dev[d].js) && g_joy_steer.axis >= 0 && g_joy_steer.axis < SDL_JoystickNumAxes(dev[d].js)) {
             /* a wheel: only a sliver of deadzone, and rescaled to START at its edge. A cut-off +-1000 without the rescale left 3% of
              * the lock dead and then jumped the steering 0x2B at once: a step exactly at the centre, which the steering motor's
              * centring then held the wheel against */
@@ -502,12 +536,13 @@ static bool pad_pedal(bool gas, int *out)         /* 0..0x610 */
 {
     int best = 0;
     rr_joyaxis_t *ax = gas ? &g_joy_gas : &g_joy_brake;
-    for (int d = 0; d < MAX_DEV; d++) {
+    for (int d = 0; d <= MAX_DEV; d++) {
         int v = 0;
-        if (dev[d].gc) {
-            int t = SDL_GameControllerGetAxis(dev[d].gc, gas ? SDL_CONTROLLER_AXIS_TRIGGERRIGHT : SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+        if (d == MAX_DEV ? xpad_ok : dev[d].gc != NULL) {
+            const SDL_GameControllerAxis a = gas ? SDL_CONTROLLER_AXIS_TRIGGERRIGHT : SDL_CONTROLLER_AXIS_TRIGGERLEFT;
+            int t = d == MAX_DEV ? xpad.axis[a] : SDL_GameControllerGetAxis(dev[d].gc, a);
             if (t > 1000) v = (t - 1000) * 0x610 / (32767 - 1000);
-        } else if (rr_input_axis_device(ax, dev[d].js) && ax->axis >= 0 && ax->axis < SDL_JoystickNumAxes(dev[d].js)) {
+        } else if (d < MAX_DEV && rr_input_axis_device(ax, dev[d].js) && ax->axis >= 0 && ax->axis < SDL_JoystickNumAxes(dev[d].js)) {
             int r = SDL_JoystickGetAxis(dev[d].js, ax->axis);
             double f = rr_input_pedal_value(ax, r);
             if (f > 0.03) v = (int)((f - 0.03) / 0.97 * 0x610);
@@ -544,6 +579,15 @@ static SDL_Surface *window_surface(int w, int h)
     return sf;
 }
 
+/* F12's file: screenshots/rr_<date>_<time>_<n><suffix>.ppm */
+static void shot_name(char *p, size_t n, const char *suffix)
+{
+    mkdir(shot_dir, 0755);
+    time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); static int k;
+    snprintf(p, n, "%s/rr_%04d%02d%02d_%02d%02d%02d_%d%s.ppm", shot_dir,
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, k++, suffix);
+}
+
 /* The game picture into picture_rect(): the engine draws the frame at the
  * render size into the shared render target (engine/render_target.c), which
  * is then scaled into the rectangle; the software oracle's pixels go in as a
@@ -557,10 +601,7 @@ static void present_picture(void)
         rr_gl_draw(vw, vh);
         if (shot_pending) {
             shot_pending = false;
-            mkdir(shot_dir, 0755);
-            char p[256]; time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); static int n;
-            snprintf(p, sizeof p, "%s/rr_%04d%02d%02d_%02d%02d%02d_%d.ppm", shot_dir,
-                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, n++);
+            char p[256]; shot_name(p, sizeof p, "");
             if (rr_gl_write_ppm(p, vw, vh)) fprintf(stderr, "[HOST] saved %s\n", p);
         }
         SDL_Rect dst = picture_rect_for(rw, rh, false);
@@ -595,6 +636,41 @@ static void present_picture(void)
 #endif
 }
 
+/* the menu over whatever is bound (the window's picture, or the headset's overlay): Nuklear in window points, drawable pixels */
+static void draw_menu(void *u)
+{
+    (void)u;
+    int ow, oh; out_size(&ow, &oh);
+    glViewport(0, 0, ow, oh);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    glDisable(GL_TEXTURE_2D); glDisable(GL_SCISSOR_TEST); glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    /* the menu draws over the picture as it is: no dimming layer (it used to darken the whole game while Esc was open) */
+    glDisable(GL_BLEND);
+    bool q = false; rr_ui_draw(&q);
+}
+
+/* THE HEADSET (--vr): each eye's picture at the eye's size -- the race from that eye, the direct polys and the text layer (the HUD)
+ * the same in both, on the screen's plane -- and the menu once over both; the window shows the left eye (engine/eng_xr.c
+ * eng_xr_present). false = no session showing frames: the window draws as usual. */
+static void xr_eye(int eye, int w, int h, void *u) { (void)u; rr_gl_draw_eye(eye, w, h); }
+static bool present_xr(bool menu_visible)
+{
+    SDL_Rect r;
+    if (!eng_xr_present(win, xr_eye, draw_menu, menu_visible, NULL, g_cfg_scaling != 0, &r)) return false;
+    if (shot_pending) {                              /* F12: both eyes */
+        shot_pending = false;
+        int ew, eh; eng_xr_eye_size(&ew, &eh);
+        for (int eye = 0; eye < 2; eye++) {
+            char p[256]; shot_name(p, sizeof p, eye ? "_R" : "_L");
+            if (eng_xr_read_eye(eye) && rr_gl_write_ppm(p, ew, eh)) fprintf(stderr, "[HOST] saved %s\n", p);
+        }
+        eng_xr_read_done();
+    }
+    return true;
+}
+
 bool rr_host_frame(void)
 {
     if (!win) return true;
@@ -624,6 +700,12 @@ bool rr_host_frame(void)
           }
       } }
     SDL_Event e;
+    if (xr_on) {
+        eng_xr_poll();                               /* the headset's session and controllers, before the events (its pointer arrives among them) */
+        for (char c; (c = eng_xr_menu_key()) != 0; ) /* its menu button and stick */
+            if (c == 'm') { if (!rr_ui_is_open()) { rr_ui_set_open(true); fprintf(stderr, "[HOST] menu open (VR)\n"); } }
+            else rr_ui_vr_key(c);
+    }
     rr_ui_input_begin();
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) return false;
@@ -674,6 +756,16 @@ bool rr_host_frame(void)
     { const int want = (!g_cfg_fullscreen || rr_ui_is_open()) ? SDL_ENABLE : SDL_DISABLE;   /* fullscreen hides the pointer for the game, but the menu needs it */
       if (SDL_ShowCursor(SDL_QUERY) != want) SDL_ShowCursor(want); }
     if (!paused && !rr_ui_is_open() && !rr_input_replaying()) {
+        xpad_ok = eng_xr_get_pad(&xpad);            /* the headset's controllers as one more pad (false without a session) */
+        { static int dbg = -1, last_rt = -1, last_lx; static uint32_t last_b;   /* RR_XRDBG=1: the VR pad's changes, and the gas the game had (bench tests) */
+          if (dbg < 0) dbg = getenv("RR_XRDBG") != NULL;
+          if (dbg && xpad_ok) {
+              const int rt = xpad.axis[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] / 4096, lx = xpad.axis[SDL_CONTROLLER_AXIS_LEFTX] / 4096;
+              if (rt != last_rt || lx != last_lx || xpad.buttons != last_b)
+                  fprintf(stderr, "[HOST] VR pad: right trigger %d  left x %d  buttons 0x%X  (gas 0x%X)\n", xpad.axis[SDL_CONTROLLER_AXIS_TRIGGERRIGHT],
+                          xpad.axis[SDL_CONTROLLER_AXIS_LEFTX], (unsigned)xpad.buttons, g_hw.gas);
+              last_rt = rt; last_lx = lx; last_b = xpad.buttons;
+          } }
         set_bit(0x1000, held(RR_COIN1));
         set_bit(0x0200, held(RR_COIN2));
         set_bit(0x0800, held(RR_SERVICE) || g_service_frames > 0);
@@ -698,17 +790,11 @@ bool rr_host_frame(void)
     /* the window may have been resized: keep the render size in step (a
      * native or widescreen size follows the window; it lands next frame) */
     apply_render_size();
-    present_picture();
-    if (rr_ui_is_open() || rr_ui_hint_active() || rr_ui_chat_active()) {            /* the menu over the game (or just the hint / chat) */
-        int ow, oh; out_size(&ow, &oh);
-        glViewport(0, 0, ow, oh);
-        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
-        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-        glDisable(GL_TEXTURE_2D); glDisable(GL_SCISSOR_TEST); glDisable(GL_ALPHA_TEST);
-        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        /* the menu draws over the picture as it is: no dimming layer (it used to darken the whole game while Esc was open) */
-        glDisable(GL_BLEND);
-        bool q = false; rr_ui_draw(&q);
+    const bool menu_visible = rr_ui_is_open() || rr_ui_hint_active() || rr_ui_chat_active();
+    if (xr_on) { int32_t sep = 0, zc = 0; float fm = 0; if (eng_xr_running()) eng_xr_stereo(&sep, &zc, &fm); rr_gl_set_stereo(sep, zc, fm); }   /* the eyes, from the next prepare on */
+    if (!(xr_on && present_xr(menu_visible))) {
+        present_picture();
+        if (menu_visible) draw_menu(NULL);           /* the menu over the game (or just the hint / chat) */
     }
     if (menu_test_step >= 0) {
         int ow, oh; out_size(&ow, &oh);
@@ -793,6 +879,8 @@ bool rr_host_paused(void) { return paused || rr_ui_is_open(); }
 void rr_host_close(void)
 {
     rr_input_record_stop();
+    if (xr_on) eng_xr_stop();                        /* while its GL context is still there */
+    xr_on = false;
     eng_ffb_close();                                 /* no force left on the wheel after we are gone */
     for (int d = 0; d < MAX_DEV; d++) if (dev[d].gc || dev[d].js) dev_remove(dev[d].id);
     if (win) { rr_ui_shutdown(); if (glc) SDL_GL_DeleteContext(glc); SDL_DestroyWindow(win); SDL_Quit(); win = NULL; glc = NULL; }

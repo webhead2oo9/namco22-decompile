@@ -268,7 +268,7 @@ changed in `raverace/rr_controls.cfg`; in Tokyo Wars and Dirt Dash, in the menu
 **Light guns.** A gun that acts as an absolute mouse (Sinden, Gun4IR, OpenFIRE, Reaper, AimTrak) works as it is: aim at the screen and shoot.
 To **reload**, aim a little OFF the screen and shoot (the pointer sits on the window's edge, which the game reads as "off screen"), or hold `R` or the
 gun's side button. The widescreen picture keeps the game's 4:3 aiming area in the middle. Guns with their own calibration need it done once in their own software. Not tested here: any real light gun hardware.
-A VR headset's controllers are a gun too: see [VR headsets](#vr-headsets-time-crisis).
+A VR headset's controllers are a gun too: see [VR headsets](#vr-headsets).
 
 **Choosing a stage.** `--stage 1`, `--stage 2` or `--stage 3` on the command line starts the game's own **Timed Game** at stage 1, 2 or 3 (unlimited lives, a best time per stage):
 the coins are put in and the choices made for you, then the gun is yours. It works from the attract screens, not during a game.
@@ -305,20 +305,30 @@ Press `Esc` and open **Display**. Your choices are saved by themselves.
 - **Aspect ratio** (when widescreen is off): 4:3 like the arcade screen, or
   stretched to fill the window.
 
-## VR headsets (Time Crisis)
+## VR headsets
 
-Time Crisis can be played in a VR headset, on a big screen in front of you, **in 3D**: the warehouse goes back
-behind the screen and the enemies stand out in front of it, while the timer and score stay flat on the screen.
-The motion controllers are the gun.
+Every game can be played in a VR headset, on a big screen in front of you, **in 3D**: the world goes back behind the
+screen and near things stand out in front of it, while the time, score, speed and radar stay flat on the screen. In Time
+Crisis the motion controllers are the gun; in the other four they are a game controller.
 
 ```bash
-./launch.sh tc --vr     # Linux
-TimeCrisis.exe --vr     # Windows (or a shortcut with --vr after the program's name)
+./launch.sh tc --vr     # Linux (and prop, rave, tokyo, dirt)
+TimeCrisis.exe --vr     # Windows (and PropCycle.exe, RaveRacer.exe, TokyoWars.exe, DirtDash.exe; or a shortcut with --vr after the program's name)
 ```
 
 It needs an OpenXR runtime that is running and set as the computer's OpenXR runtime: SteamVR, Meta Quest Link,
 Windows Mixed Reality, Monado and so on. Without one, the game says why in its log and plays in the window as
-usual. In VR the window shows the left eye.
+usual. In VR the window shows the left eye, in a 640 x 480 window (`--window N` makes it bigger) even when the
+game is set to full screen: the menu lays itself out in the window, and a bigger one would make it small in the headset.
+
+**The menu** shows on the screen in the headset. The menu button opens it (Index and Windows Mixed Reality: click the
+right stick; Vive: click the right trackpad). In the menu the controller is a pointer: point and pull the trigger.
+`B` / `Y` or the menu button closes it; except in Prop Cycle (a mouse menu) the stick also moves and `A` / `X` chooses.
+Its **VR** page (in Prop Cycle, the **VR** menu) sets the **screen distance** (0.5 to 5 m; 1.5 m to begin with), the
+**screen size** (100 % is life size: the game's own field of view), the **3D depth** (0 is a flat screen) and
+**recenters** the screen. They are saved by themselves.
+
+**Time Crisis:**
 
 | Controller | What it does |
 |---|---|
@@ -326,18 +336,29 @@ usual. In VR the window shows the left eye.
 | Grip | Foot pedal |
 | `A` / `X` | Coin |
 | `B` / `Y` | Put the screen straight in front of you again |
-| Menu button (Index and Windows Mixed Reality: click the stick; Vive: click the trackpad) | Menu. In the menu the stick moves, the trigger or `A` chooses, `B` / `Y` goes back |
 
 To reload, point off the screen and shoot, as at the arcade. The recoil is a short buzz in the gun hand.
-The menu shows on the screen in the headset. Its **VR** page sets the **screen distance** (0.5 to 5 m;
-1.5 m to begin with), the **screen size** (100 % is the game's own 45-degree view: life size), the **3D depth**
-(0 is a flat screen) and **recenters** the screen. They are saved by themselves.
 
+**Prop Cycle, Rave Racer, Tokyo Wars and Dirt Dash:** the two controllers are one game controller, the left one its
+left half (`X`, `Y`, the left stick and trigger) and the right one its right half (`A`, `B`, the right stick and trigger),
+so each game's controller buttons work as they do on a pad.
+
+| Controller | Prop Cycle | Rave Racer | Tokyo Wars | Dirt Dash |
+|---|---|---|---|---|
+| Left stick | Steer and lean | Steer | Steer | Steer |
+| Right trigger | Pedal | Gas | Forward pedal | Gas |
+| Left trigger | | Brake | Backward pedal | Brake |
+| Click the left stick | Coin | Coin | Coin | Coin |
+| `A` | Start | Gas | Start | View / select |
+| `B` | | Brake | Right gun trigger | Motion stop |
+| `X` / `Y` | | — / view | Left gun trigger / start | Shift down / up |
+| Grips (left / right) | Service / — | Shift down / up | Left / right gun trigger | Shift down / up |
+
+- The 3D follows the game's camera: a zoomed-in shot (a replay's telephoto, a close-up) has less depth, so the far
+  world never goes past the distance your eyes can comfortably look into.
 - On Linux the game talks to the headset through X11 (XWayland on a Wayland desktop): OpenXR's OpenGL link on Linux needs it.
 - On Windows `openxr_loader.dll` sits next to the games; only `--vr` uses it.
-- Tokyo Wars and Dirt Dash take `--vr` too (the screen, the 3D, the menu; the keyboard or a pad drives as usual), but their 3D
-  depth scale is a guess and they have not been tried. Prop Cycle and Rave Racer have no VR yet.
-- Tested on Windows with a real headset, and in the [OpenXR Simulator](https://github.com/webhead2oo9/OpenXR-Simulator) under Wine.
+- Tested on Windows with a real headset (Time Crisis), and all five games in the [OpenXR Simulator](https://github.com/webhead2oo9/OpenXR-Simulator) under Wine.
   Not tried yet: a headset on Linux.
 
 ## If it does not work

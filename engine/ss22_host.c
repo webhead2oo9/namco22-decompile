@@ -27,6 +27,7 @@
 #include "eng_ffb.h"
 #include "gl_warn.h"
 #include "eng_xr.h"
+#include "eng_cfg.h"
 #include "quad_gl.h"
 
 #define FRAME_NS 16693000ull                      /* 1 / 59.906 Hz, 25.6 MHz / 814 / 525 */
@@ -39,6 +40,10 @@ static bool xr_on;                                 /* --vr: an OpenXR session sh
 static bool stereo_shots;                          /* ENG_STEREO_SHOTS: headless --shots also write each eye */
 static uint64_t next_ns, vs_t0;
 static int vs_frames;
+/* the headset's side of the menu and the settings (engine/eng_xr.h eng_xr_host) */
+static bool xr_wide(void) { return g_eng_disp.wide != 0; }
+static void xr_cfg_set(const char *key, int v) { eng_cfg_set_int(key, v); }
+static const eng_ui_page xr_page = { "VR", 520, 150, 0, eng_xr_rows, eng_xr_row_value, NULL, eng_xr_row_text, eng_xr_row_change, eng_xr_notes };
 
 static uint64_t now_ns(void)                     /* split the scaling: counter * 1e9 overflows 64 bits (and this works on Windows too) */
 {
@@ -69,6 +74,9 @@ bool ss22_host_open(const ss22_host_game *g, int scale, bool fs, bool vr)      /
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) { fprintf(stderr, "[HOST] SDL: %s\n", SDL_GetError()); return false; }
     eng_gl_context_attributes();
     eng_disp_load(game->cfg_file, scale, fs);                /* the saved display choices; --window N / --fullscreen override */
+    if (vr && !fs) g_eng_disp.winmode = 0;                  /* the headset: the window is a mirror, and the menu lays itself out in it -- a
+                                                             * fullscreen one would make the menu small on the headset's screen. The
+                                                             * saved choice stays (only the menu's own changes are written) */
     if (game->aim) SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");      /* a light gun: the click that focuses the window is still a shot */
     g_eng_disp_light_gun = game->aim != NULL;
     win = SDL_CreateWindow(game->title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -96,8 +104,9 @@ bool ss22_host_open(const ss22_host_game *g, int scale, bool fs, bool vr)      /
     eng_ui_add_page(game->input_page());
     if (game->extra_page) eng_ui_add_page(game->extra_page());
     if (vr) {                                        /* the headset: the window shows the left eye, the timer paces the game (xrWaitFrame paces the headset) */
-        xr_on = eng_xr_start(game->title, game->units_per_m, game->aim != NULL);
-        if (xr_on) { vsync = false; SDL_GL_SetSwapInterval(0); eng_ui_add_page(eng_xr_page()); }
+        const eng_xr_host xh = { game->title, game->units_per_m, game->hfov_deg, game->aim != NULL, xr_wide, eng_ui_is_open, eng_cfg_int, xr_cfg_set };
+        xr_on = eng_xr_start(&xh);
+        if (xr_on) { vsync = false; SDL_GL_SetSwapInterval(0); eng_ui_add_page(&xr_page); }
         else fprintf(stderr, "[HOST] no VR: playing in the window\n");
     }
     if (!eng_ui_init(win, game->title)) fprintf(stderr, "[HOST] menu: Nuklear init failed\n");
@@ -119,9 +128,9 @@ bool ss22_host_open_headless(void)
     const char *e = getenv("ENG_SHOT_W");
     if (e && atoi(e) >= 640 && atoi(e) <= 2560) headless_w = atoi(e);
     headless_open = eng_gl_open_headless(headless_w, 480);
-    /* ENG_STEREO_SHOTS=<sep>:<zconv> (tests): the two eyes a headset gets (engine/ss22_gl.h ss22_set_stereo, the game's units); every
-     * --shots picture is the left eye, with <name>_L.ppm and <name>_R.ppm beside it */
-    if ((e = getenv("ENG_STEREO_SHOTS"))) { int s = 0, z = 0; sscanf(e, "%d:%d", &s, &z); ss22_set_stereo(s, z); stereo_shots = s > 0; }
+    /* ENG_STEREO_SHOTS=<sep>:<zconv>[:<focal_max>] (tests): the two eyes a headset gets (engine/ss22_gl.h ss22_set_stereo, the game's
+     * units; no focal_max = no limit); every --shots picture is the left eye, with <name>_L.ppm and <name>_R.ppm beside it */
+    if ((e = getenv("ENG_STEREO_SHOTS"))) { int s = 0, z = 0; float f = 0; sscanf(e, "%d:%d:%f", &s, &z, &f); ss22_set_stereo(s, z, f); stereo_shots = s > 0; }
     return headless_open;
 }
 
@@ -200,44 +209,35 @@ static SDL_Rect present_window(int *rw, int *rh)
 }
 
 /* THE HEADSET (--vr): each eye into its picture -- the gun's crosshair at the same place in both, ON the screen's plane, where the
- * aim ray meets it, and the menu over both (drawn once, into the overlay, at the window's size) -- the two pictures to the headset,
- * the left one into the window (letterboxed to its shape). */
+ * aim ray meets it -- and the menu over both; the window shows the left eye (engine/eng_xr.c eng_xr_present). */
+typedef struct { bool cross; float ax, ay; } xr_frame;
+static void xr_eye(int eye, int w, int h, void *u)
+{
+    const xr_frame *f = u;
+    ss22_draw_eye(eye, w, h);
+    if (f->cross) {                                  /* scene units: the 4:3 picture is 0..640 x 0..480 in either shape */
+        glViewport(0, 0, w, h);
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(g_scene_x0, g_scene_x1, 480, 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+        draw_cross(f->ax * 640.0f, f->ay * 480.0f, 20.0f);
+    }
+}
+static void xr_menu(void *u) { (void)u; bool quit = false; eng_ui_draw(&quit); }
 static SDL_Rect present_xr(int *rw, int *rh)
 {
-    static int ew = 1280, eh = 960;                  /* the last pictures' size */
-    float ax = 0, ay = 0;
-    const bool cross = game->aim && g_eng_disp.crosshair && !eng_ui_is_open() && game->aim(&ax, &ay);
-    if (eng_xr_frame_begin(&ew, &eh)) {
-        int dw, dh; SDL_GL_GetDrawableSize(win, &dw, &dh);
-        if (eng_ui_visible() && eng_xr_overlay_begin(dw, dh)) { bool quit = false; eng_ui_draw(&quit); eng_xr_overlay_end(); }
-        for (int eye = 0; eye < 2; eye++) {
-            eng_xr_eye_target(eye);
-            ss22_draw_eye(eye, ew, eh);
-            if (cross) {                             /* scene units: the 4:3 picture is 0..640 x 0..480 in either shape */
-                glViewport(0, 0, ew, eh);
-                glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(g_scene_x0, g_scene_x1, 480, 0, -1, 1);
-                glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-                draw_cross(ax * 640.0f, ay * 480.0f, 20.0f);
-            }
-            eng_xr_overlay_draw();
-        }
-    }
-    eng_xr_frame_end();
+    xr_frame f = { false, 0, 0 };
+    f.cross = game->aim && g_eng_disp.crosshair && !eng_ui_is_open() && game->aim(&f.ax, &f.ay);
+    SDL_Rect r = { 0, 0, 0, 0 };
+    eng_xr_present(win, xr_eye, xr_menu, eng_ui_visible(), &f, eng_disp_sharp(), &r);
+    eng_xr_eye_size(rw, rh);
     if (shot_pending) {                              /* F12: both eyes */
         shot_pending = false;
         for (int eye = 0; eye < 2; eye++) {
             char p[160]; shot_name(p, sizeof p, eye ? "_R" : "_L");
-            if (eng_xr_read_eye(eye) && eng_gl_write_ppm(p, ew, eh)) fprintf(stderr, "[HOST] saved %s\n", p);
+            if (eng_xr_read_eye(eye) && eng_gl_write_ppm(p, *rw, *rh)) fprintf(stderr, "[HOST] saved %s\n", p);
         }
         eng_xr_read_done();
     }
-    *rw = ew; *rh = eh;
-    int dw, dh; SDL_GL_GetDrawableSize(win, &dw, &dh);
-    const double a = (double)ew / eh;
-    SDL_Rect r = { 0, 0, dw, (int)(dw / a + 0.5) };
-    if (r.h > dh) { r.h = dh; r.w = (int)(dh * a + 0.5); }
-    r.x = (dw - r.w) / 2; r.y = (dh - r.h) / 2;
-    eng_xr_mirror(r.x, r.y, r.w, r.h, eng_disp_sharp());
     return r;
 }
 
@@ -245,7 +245,7 @@ static void present(void)
 {
     int rw, rh;
     const bool xr = xr_on && eng_xr_running();
-    if (xr_on) { int32_t sep = 0, zc = 0; if (xr) eng_xr_stereo(&sep, &zc); ss22_set_stereo(sep, zc); }   /* the eyes, from the next prepare on */
+    if (xr_on) { int32_t sep = 0, zc = 0; float fm = 0; if (xr) eng_xr_stereo(&sep, &zc, &fm); ss22_set_stereo(sep, zc, fm); }   /* the eyes, from the next prepare on */
     const SDL_Rect r = xr ? present_xr(&rw, &rh) : present_window(&rw, &rh);
     pic_r = r; gun_r = r;
     if (xr || g_eng_disp.wide) { const int w = (int)(r.h * 4.0 / 3.0 + 0.5); gun_r.x = r.x + (r.w - w) / 2; gun_r.w = w; }   /* the 2D layers and the gun stay 4:3 */

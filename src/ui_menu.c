@@ -29,6 +29,8 @@
 #include "ui_menu.h"
 #include "propcycl.h"
 #include "vaddr.h"
+#include "eng_xr.h"
+#include <stdarg.h>
 #ifndef W
 #define W _W
 #endif
@@ -48,6 +50,21 @@ static nk_bool wide_hud_edges = 1;                 /* widescreen: the HUD slides
 static int cur_aspect, win_mode, want_w, want_h;
 static int display_cfg;          /* the cfg carried display settings: apply them at startup */
 static int naspect(void);
+/* VR (--vr, engine/eng_xr.h): its settings live in this cfg too, as
+ * vr_<name>=<int> lines (eng_xr names them); written only once one is set, so
+ * a player who never ran --vr keeps a cfg without them. The VR menu shows
+ * while a headset session exists (ui_vr_on). */
+#define VR_CFG_MAX 8
+static struct { char key[32]; int v; } vr_cfg[VR_CFG_MAX];
+static int  vr_ncfg;
+static bool vr_menu;
+static void vr_cfg_put(const char *key, int v)
+{
+    int i = 0;
+    while (i < vr_ncfg && strcmp(vr_cfg[i].key, key)) i++;
+    if (i == vr_ncfg) { if (vr_ncfg == VR_CFG_MAX) return; vr_ncfg++; snprintf(vr_cfg[i].key, sizeof vr_cfg[i].key, "%s", key); }
+    vr_cfg[i].v = v;
+}
 
 /* ---- controls ---------------------------------------------------------- */
 SDL_Scancode ui_binding[ACT_COUNT];
@@ -89,6 +106,7 @@ int ui_controls_save(void) {
     fprintf(f, "aspect=%d\n", cur_aspect);
     fprintf(f, "window_mode=%d\n", win_mode);
     fprintf(f, "resolution=%dx%d\n", want_w, want_h);
+    for (int i = 0; i < vr_ncfg; i++) fprintf(f, "%s=%d\n", vr_cfg[i].key, vr_cfg[i].v);
     { extern void input_joy_cfg_save(FILE *); input_joy_cfg_save(f); }
     fclose(f);
     return 1;
@@ -105,6 +123,7 @@ int ui_controls_load(void) {
         *eq = '\0';
         if (!strcmp(line, "volume")) { audio_hle_set_volume(atoi(eq + 1) / 100.0f); continue; }
         if (!strcmp(line, "freeplay")) { g_freeplay_cfg = atoi(eq + 1) ? 1 : 0; continue; }
+        if (!strncmp(line, "vr_", 3)) { vr_cfg_put(line, atoi(eq + 1)); continue; }
         if (!strcmp(line, "widescreen")) { widescreen = atoi(eq + 1) ? 1 : 0; display_cfg = 1; continue; }
         if (!strcmp(line, "wide_hud")) { extern int g_wide_hud_center; wide_hud_edges = atoi(eq + 1) ? 1 : 0; g_wide_hud_center = !wide_hud_edges; display_cfg = 1; continue; }
         if (!strcmp(line, "aspect")) { int a = atoi(eq + 1); if (a >= 0 && a < naspect()) cur_aspect = a;
@@ -430,6 +449,34 @@ bool ui_restart_requested(void) { return restart_req; }
 /* a one-line hint at the bottom of the window while the menu is closed (a pad has no Esc: how to reach the menu) */
 static char hint_text[96]; static int hint_left;
 void ui_set_hint(const char *text, int frames) { snprintf(hint_text, sizeof hint_text, "%s", text ? text : ""); hint_left = frames; }
+bool ui_visible(void) { return menu_open || (hint_left > 0 && hint_text[0]); }
+
+/* VR: the settings file's side of eng_xr_host (cfg_get / cfg_set) */
+int ui_vr_cfg_get(const char *key, int def)
+{
+    for (int i = 0; i < vr_ncfg; i++) if (!strcmp(vr_cfg[i].key, key)) return vr_cfg[i].v;
+    return def;
+}
+void ui_vr_cfg_set(const char *key, int v) { vr_cfg_put(key, v); ui_controls_save(); }
+/* A headset session runs (main.c): the VR menu appears, and the window is a
+ * plain 640 x 480 one whatever the saved window mode -- the menu lays itself
+ * out in the window's points and the headset spreads the window over the
+ * whole virtual screen, so a fullscreen window would shrink it to
+ * unreadable. The saved mode itself is left alone (it is not re-saved). */
+void ui_vr_on(void)
+{
+    vr_menu = true;
+    if (g_win && (SDL_GetWindowFlags(g_win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP))) {
+        SDL_SetWindowFullscreen(g_win, 0);
+        SDL_SetWindowSize(g_win, SCREEN_WIDTH, SCREEN_HEIGHT);
+    }
+}
+static void vr_note(const char *fmt, ...)
+{
+    char b[160]; va_list ap;
+    va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    nk_label(ctx, b, NK_TEXT_LEFT);
+}
 
 void ui_draw(SDL_Window *win, bool *quit) {
     if (ctx && !menu_open && hint_left > 0 && hint_text[0]) {
@@ -452,7 +499,7 @@ void ui_draw(SDL_Window *win, bool *quit) {
     if (nk_begin(ctx, "menubar", nk_rect(0, 0, (float)ww, 28),
                  NK_WINDOW_NO_SCROLLBAR)) {
         nk_menubar_begin(ctx);
-        nk_layout_row_begin(ctx, NK_STATIC, 20, 10);
+        nk_layout_row_begin(ctx, NK_STATIC, 20, vr_menu ? 11 : 10);
 
         /* ---- File ---- */
         nk_layout_row_push(ctx, 50);
@@ -469,6 +516,34 @@ void ui_draw(SDL_Window *win, bool *quit) {
             if (nk_button_label(ctx, "Restart")) { restart_req = true; *quit = true; }
             if (nk_button_label(ctx, "Exit")) *quit = true;
             nk_menu_end(ctx);
+        }
+
+        /* ---- VR ---- (a headset session: engine/eng_xr.h's rows, the same
+         * ones every game's menu shows; < > step a value, the action row is a
+         * button; in the headset the controller is this menu's pointer) */
+        if (vr_menu) {
+            nk_layout_row_push(ctx, 40);
+            if (nk_menu_begin_label(ctx, "VR", NK_TEXT_LEFT, nk_vec2(440, 236))) {
+                static const float cols[4] = { 0.36f, 0.09f, 0.46f, 0.09f };
+                for (int r = 0; r < eng_xr_rows(); r++) {
+                    char l[64], v[96];
+                    eng_xr_row_text(r, l, sizeof l, v, sizeof v);
+                    if (eng_xr_row_value(r)) {
+                        nk_layout_row(ctx, NK_DYNAMIC, 26, 4, cols);
+                        nk_label(ctx, l, NK_TEXT_LEFT);
+                        if (nk_button_label(ctx, "<")) eng_xr_row_change(r, -1);
+                        nk_label(ctx, v, NK_TEXT_CENTERED);
+                        if (nk_button_label(ctx, ">")) eng_xr_row_change(r, +1);
+                    } else {
+                        nk_layout_row(ctx, NK_DYNAMIC, 26, 2, (const float[]){ 0.36f, 0.64f });
+                        nk_label(ctx, l, NK_TEXT_LEFT);
+                        if (nk_button_label(ctx, v)) eng_xr_row_change(r, 0);
+                    }
+                }
+                nk_layout_row_dynamic(ctx, 18, 1);
+                eng_xr_notes(vr_note);
+                nk_menu_end(ctx);
+            }
         }
 
         /* ---- Display ---- */

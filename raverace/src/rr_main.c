@@ -13,6 +13,7 @@
  * interrupt's level, calls the handler, and restores SR afterwards.
  *
  *   rr <rom_dir> [--frames N] [--dump DIR]    headless run
+ *   rr <rom_dir> --vr                         in a VR headset (OpenXR), the window showing the left eye
  */
 #include <SDL.h>
 #include "rr_romzip.h"
@@ -35,12 +36,13 @@
 #include "rr_link.h"
 #include "rr_net.h"
 
-bool rr_host_open(int scale);
+bool rr_host_open(int scale, bool vr);
 bool rr_host_frame(void);
 bool rr_host_paused(void);
 void rr_host_close(void);
 int rr_host_joytest(void);
 static int windowed;
+static bool vr;                                /* --vr: the picture in an OpenXR headset too (engine/eng_xr.h); implies a window */
 /* THE RENDERER. 1 = the shared engine's OpenGL pipeline (../engine, src/rr_gl.c):
  * the game's renderer, always, in the window and headless. 0 = src/rr_video.c,
  * the software MAME port -- a test ORACLE, compiled only into the dev binaries
@@ -260,7 +262,15 @@ void rr_tick(void)
     if (perf_on) t_frame_start = now_ms();
     if (shot_dir && shot_every && frame % shot_every == 0) {
         char p[1024]; snprintf(p, sizeof p, "%s/f%05u.ppm", shot_dir, frame);
-        if (g_rr_gl && gl_ok && !windowed) { rr_gl_draw(gl_w, gl_h); rr_gl_write_ppm(p, gl_w, gl_h); }
+        if (g_rr_gl && gl_ok && !windowed) {
+            rr_gl_draw(gl_w, gl_h); rr_gl_write_ppm(p, gl_w, gl_h);
+            if (rr_gl_stereo_frame())                    /* RR_STEREO_SHOTS: the two eyes beside it (the plain picture is the left eye) */
+                for (int eye = 0; eye < 2; eye++) {
+                    snprintf(p, sizeof p, "%s/f%05u_%c.ppm", shot_dir, frame, eye ? 'R' : 'L');
+                    rr_gl_draw_eye(eye, gl_w, gl_h); rr_gl_write_ppm(p, gl_w, gl_h);
+                }
+            if (rr_gl_stereo_frame()) fprintf(stderr, "[RR] stereo shot f%u: focal %.1f px\n", frame, rr_gl_focal());
+        }
 #ifdef RR_ORACLE
         else if (!g_rr_gl) rr_video_write_ppm(p);
 #endif
@@ -326,6 +336,7 @@ int main(int argc, char **argv)
             windowed = -1;                                      /* -1: the saved window size */
             if (i + 1 < argc && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9' && !argv[i + 1][1]) windowed = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--vr")) { vr = true; if (!windowed) windowed = -1; }
         else if (!strcmp(argv[i], "--perf")) perf_on = 1;
         else if (!strcmp(argv[i], "--sndsweep") && i + 1 < argc) sweep_arg(argv[++i]);
         else if (!strcmp(argv[i], "--perflog") && i + 1 < argc) { perflog = fopen(argv[++i], "w"); perf_on = perflog != NULL; }
@@ -369,13 +380,17 @@ int main(int argc, char **argv)
     if (rec_path && !rr_input_record_start(rec_path)) return 2;
     g_rr_gl = use_gl < 0 ? (windowed != 0) : use_gl;
     if (windowed) {
-        if (!rr_host_open(windowed > 0 ? windowed : 0)) return 2;
+        if (!rr_host_open(windowed > 0 ? windowed : 0, vr)) return 2;
         max_frames = 0xFFFFFFFFu;
     } else if (g_rr_gl) {
         const char *e = getenv("RR_RENDER_SIZE"); int w, h;
         if (e && sscanf(e, "%dx%d", &w, &h) == 2 && w >= 64 && h >= 48) { gl_w = w; gl_h = h; }
         /* no GL here: the game still runs (sound, traces, dumps), without a picture */
         gl_ok = rr_gl_open_headless(gl_w, gl_h);
+        /* RR_STEREO_SHOTS=<sep>:<zconv>[:<focal_max>] (tests): the two eyes a VR headset gets (rr_gl_set_stereo, the game's view-space
+         * units; no focal_max = no limit); every --shots picture is then the left eye, with f<n>_L.ppm and f<n>_R.ppm beside it and
+         * the frame's focal length logged */
+        if ((e = getenv("RR_STEREO_SHOTS"))) { int s = 0, z = 0; float f = 0; sscanf(e, "%d:%d:%f", &s, &z, &f); rr_gl_set_stereo(s, z, f); }
         if (!gl_ok && shot_dir) { fprintf(stderr, "[RR] --shots needs OpenGL\n"); return 2; }
     }
     /* First run: take the ROMs out of MAME's raverace.zip + namcoc74.zip if the ROM

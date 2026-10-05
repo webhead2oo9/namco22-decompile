@@ -225,7 +225,11 @@ static const ss22_game game = {
     .video = { { "dt1cg0.8d", "dt1cg1.10d", "dt1cg2.12d", "dt1cg3.13d", "dt1cg4.14d", "dt1cg5.16d", "dt1cg6.18d", "dt1cg7.19d" },
                "dt1ccrl.3d", "dt1ccrh.1d", { "dt1scg0.12f", "dt1scg1.10f" }, 2, 0x1000000, 0xFF,
                true, true,     /* MAME: a 16 MB region, ROMREGION_ERASEFF, the two chips at 0 and 0x200000; the spot is on in its captures */
-               .hud = { hud_marks, 2, 0x10, -1 } },
+               .hud = { hud_marks, 2, 0x80, -1 } },   /* HUD sprites: depth 0..0x80. The race's own are 0..2, but the menus' pictures (the stage
+                                                       * map, the banners, the car select) sit at 0x0A..0x66 over a full-frame backdrop, and in a
+                                                       * headset's stereo a sprite deeper than this is a billboard in the world: at 0x10 the map
+                                                       * floated 42 px off its own text labels. The nearest world sprite, the dust a car kicks up,
+                                                       * is 0xA8 (a 7200-frame autoplay); widescreen only moves sprites this shallow in a race */
     .input = &input,
     .roms = k_roms, .n_roms = NROMS,
     .entry = L_1074,
@@ -234,6 +238,10 @@ static const ss22_game game = {
     .autoplay = autoplay,
     .start = start, .start_names = "city, jungle, hill, mountain, snow",
     .pedal_full = { 0x140, 0x100 },
+    .units_per_m = 1000,                /* the rivals' cars (view-space points of a race frame on the city stage): 4 110 units long, 1 540 wide, 1 150 tall
+                                         * over a road 1 200 below the driver's eye -- a rally hatchback's ~4.1 m, an eye ~1.2 m up: a millimetre a unit */
+    .hfov_deg = 60.0f,                  /* the race's first view (the hood) has a focal length of 554.25 px: 2 atan(320 / 554.25); the other views
+                                         * the View button cycles through are 589.4 (57 deg) and 381.4 (80 deg) */
 };
 
 int main(int argc, char **argv) { return ss22_main(argc, argv, &game); }
