@@ -496,10 +496,16 @@ void ui_draw(SDL_Window *win, bool *quit) {
     SDL_GetWindowSize(win, &ww, &wh);
     { static int lw, lh; if (ww != lw || wh != lh) { fprintf(stderr, "[DISPLAY] f%u window now %dx%d\n", g_sys.frame_count, ww, wh); lw = ww; lh = wh; } }
 
-    if (nk_begin(ctx, "menubar", nk_rect(0, 0, (float)ww, 28),
+    /* THE BAR's titles are 840 px wide (880 with the VR menu) before Nuklear's spacing: a narrower window -- 640 x 480 is the
+     * 1x size and the --vr window's -- gets them in two rows (a static row starts the next after its columns), so the last menus
+     * are still there to click */
+    const int nitems = vr_menu ? 11 : 10;
+    const bool two_rows = ww < (vr_menu ? 880 : 840) + 6 * nitems;
+    const float bar_h = two_rows ? 52.0f : 28.0f;
+    if (nk_begin(ctx, "menubar", nk_rect(0, 0, (float)ww, bar_h),
                  NK_WINDOW_NO_SCROLLBAR)) {
         nk_menubar_begin(ctx);
-        nk_layout_row_begin(ctx, NK_STATIC, 20, vr_menu ? 11 : 10);
+        nk_layout_row_begin(ctx, NK_STATIC, 20, two_rows ? (nitems + 1) / 2 : nitems);
 
         /* ---- File ---- */
         nk_layout_row_push(ctx, 50);
@@ -839,7 +845,7 @@ void ui_draw(SDL_Window *win, bool *quit) {
      * not see keys, and a frozen display list makes the list stable to read. */
     if (objects_open) {
         int n = render_objlist_count();
-        if (nk_begin(ctx, "Objects on screen", nk_rect(8, 34, 240, 420),
+        if (nk_begin(ctx, "Objects on screen", nk_rect(8, bar_h + 6, 240, 420),
                      NK_WINDOW_TITLE | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE |
                      NK_WINDOW_CLOSABLE | NK_WINDOW_BORDER)) {
             int hovered = -1;
@@ -883,7 +889,7 @@ void ui_draw(SDL_Window *win, bool *quit) {
      * frozen and stable, exactly like the Objects picker's own contract. */
     if (billboards_open) {
         int n = render_billboard_list_count();
-        if (nk_begin(ctx, "Billboards on screen", nk_rect(8, 34, 260, 420),
+        if (nk_begin(ctx, "Billboards on screen", nk_rect(8, bar_h + 6, 260, 420),
                      NK_WINDOW_TITLE | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE |
                      NK_WINDOW_CLOSABLE | NK_WINDOW_BORDER)) {
             int hovered = -1;
@@ -926,7 +932,7 @@ void ui_draw(SDL_Window *win, bool *quit) {
      * index-while-paused contract as Billboards above. */
     if (banners_open) {
         int n = banner_calls_count();
-        if (nk_begin(ctx, "Banners on screen", nk_rect(8, 34, 280, 420),
+        if (nk_begin(ctx, "Banners on screen", nk_rect(8, bar_h + 6, 280, 420),
                      NK_WINDOW_TITLE | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE |
                      NK_WINDOW_CLOSABLE | NK_WINDOW_BORDER)) {
             int hovered = -1;

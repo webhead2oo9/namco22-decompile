@@ -182,7 +182,9 @@ void eng_xr_stereo(int32_t *sep, int32_t *zconv, float *focal_max)
     *sep   = (int32_t)(0.064 * upm * vr_depth / 100.0 + 0.5);
     *zconv = (int32_t)(vr_dist_cm / 100.0 * upm + 0.5);
     /* infinity on the screen: focal * sep / zconv pixels of the 640, on a screen scr_w43() wide -- 0.064 m (the eyes' own) * depth *
-     * size * focal / (320 / tan(half_fov)): the game's own lens at size 100 % puts it at the eyes' separation, a longer one past */
+     * size * focal / (320 / tan(half_fov)). The game's own lens at size 100 % puts it at depth x the eyes' separation; a longer lens
+     * is held to that. Depth is left out on purpose: it is the player's own scale for every lens (above 100 % the far world goes
+     * past infinity: asked for), and putting it in would cancel it for the game's own lens. */
     *focal_max = (float)(320.0 / tan(half_fov) * 100.0 / vr_size);
 }
 
@@ -672,7 +674,7 @@ void eng_xr_poll(void)
     XrActiveActionSet as = { aset, XR_NULL_PATH };
     XrActionsSyncInfo si = { XR_TYPE_ACTIONS_SYNC_INFO }; si.countActiveActionSets = 1; si.activeActionSets = &as;
     if (XR_FAILED(xrSyncActions(sess, &si))) { gun_ok = ptr_ok = false; return; }
-    static bool trig_prev[2], cen_prev, menu_prev, ok_prev;
+    static bool trig_prev[2], cen_prev, menu_prev, ok_prev, open_prev;
     bool trig[2], grip[2], ax[2], by[2], click[2], menu = false;
     float trv[2];
     XrVector2f stick[2];
@@ -693,6 +695,14 @@ void eng_xr_poll(void)
         /* THE MENU has the controllers (the host reads none of the game's controls while it is open): the pointer and its trigger
          * as the mouse, the stick steps, A / X is OK, B / Y and the menu button go back */
         static int last_x = -1, last_y = -1;
+        if (!open_prev) {
+            /* just opened: the menu's button comes up, off every widget -- a press it saw before it closed may never have been let go
+             * (closed with the trigger held, or a release queued behind the key that closed it: a closed menu takes no events), and
+             * Nuklear ignores a press of a button it holds down. A trigger already held counts as down, so it clicks nothing until
+             * it is let go and pulled again. */
+            push_mouse(SDL_MOUSEBUTTONUP, -1, -1, 0, 0);
+            ptr_down = trig[gun_hand];
+        }
         if (ptr_ok && (ptr_x != last_x || ptr_y != last_y)) {
             push_mouse(SDL_MOUSEMOTION, ptr_x, ptr_y, last_x < 0 ? 0 : ptr_x - last_x, last_y < 0 ? 0 : ptr_y - last_y);
             last_x = ptr_x; last_y = ptr_y;
@@ -729,7 +739,7 @@ void eng_xr_poll(void)
             pad_ok = true;
         }
     }
-    cen_prev = cen; menu_prev = menu; ok_prev = ok;
+    cen_prev = cen; menu_prev = menu; ok_prev = ok; open_prev = menu_now;
 }
 
 /* ---- frames ------------------------------------------------------------------------------------------------------------------- */

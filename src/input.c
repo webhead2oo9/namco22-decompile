@@ -278,7 +278,7 @@ static int pad_axis(SDL_GameControllerAxis a) {
     eng_xr_pad xp;
     return eng_xr_get_pad(&xp) ? stick_deadzone(xp.axis[a]) : 0;
 }
-/* a trigger, 0..32767: the furthest pulled of every pad's */
+/* a trigger, 0..32767: the furthest pulled of every pad's (the pedal) */
 static int pad_trigger(SDL_GameControllerAxis a) {
     int best = 0;
     for (int i = 0; i < MAX_PADS; i++) {
@@ -535,9 +535,20 @@ void input_pausecam_update(void)
     yaw   += pad_axis(SDL_CONTROLLER_AXIS_LEFTX)  / 32767.0f;
     pitch += pad_axis(SDL_CONTROLLER_AXIS_LEFTY)  / 32767.0f;   /* stick up (negative) raises it */
     dolly += pad_axis(SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
-    { int lt = pad_trigger(SDL_CONTROLLER_AXIS_TRIGGERLEFT), rt = pad_trigger(SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-      if (lt > 3000) dolly += lt / 32767.0f;       /* LT: back out */
-      if (rt > 3000) dolly -= rt / 32767.0f; }     /* RT: move in */
+    for (int i = 0; i <= MAX_PADS; i++) {       /* every pad's triggers add up; the last slot is a VR headset's controllers */
+        int lt, rt;
+        if (i < MAX_PADS) {
+            if (!pads[i]) continue;
+            lt = SDL_GameControllerGetAxis(pads[i], SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+            rt = SDL_GameControllerGetAxis(pads[i], SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+        } else {
+            eng_xr_pad xp;
+            if (!eng_xr_get_pad(&xp)) continue;
+            lt = xp.axis[SDL_CONTROLLER_AXIS_TRIGGERLEFT]; rt = xp.axis[SDL_CONTROLLER_AXIS_TRIGGERRIGHT];
+        }
+        if (lt > 3000) dolly += lt / 32767.0f;     /* LT: back out */
+        if (rt > 3000) dolly -= rt / 32767.0f;     /* RT: move in */
+    }
     g_pausecam_yaw += yaw * ORBIT;
     if (g_pausecam_yaw >  180.0f) g_pausecam_yaw -= 360.0f;
     if (g_pausecam_yaw < -180.0f) g_pausecam_yaw += 360.0f;

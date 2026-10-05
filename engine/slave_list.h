@@ -13,9 +13,10 @@ typedef uint32_t (*eng_word_fn)(int index);
  * mirror's sub-window stays the game's flat picture).
  *   A LONG LENS: on screen a point's disparity is focal * dx * (1/zconv - 1/z), so it grows with the camera's focal length -- a
  * telephoto attract shot (Tokyo Wars' reach 9x the battle view's) would put the far world past infinity and make the eyes diverge.
- * focal_max is the focal length whose infinity is the eyes' own separation on the headset's screen (eng_xr_stereo); a viewport with
- * a longer lens gets its eyes moved in by focal_max / focal, so its world never goes farther than infinity (it flattens, as a zoom
- * does). The zero-parallax plane stays put.
+ * focal_max is the game's own lens on the headset's screen (eng_xr_stereo); a viewport with a longer lens gets its eyes moved in by
+ * focal_max / focal, so its far world goes no farther than the game's own lens puts it (it flattens, as a zoom does). At 3D depth
+ * 100 % that is infinity -- the eyes' own separation; a deeper setting scales every lens alike, the player's choice. The
+ * zero-parallax plane stays put.
  *   The walk reports the last such viewport's focal length, capped at focal_max -- what the parallax follows, so a flat billboard's
  * own shift, dx * focal * (1/zconv - 1/z), matches the world's (0 = none: no world this frame). */
 typedef struct {

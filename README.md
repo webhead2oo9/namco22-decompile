@@ -325,8 +325,9 @@ game is set to full screen: the menu lays itself out in the window, and a bigger
 right stick; Vive: click the right trackpad). In the menu the controller is a pointer: point and pull the trigger.
 `B` / `Y` or the menu button closes it; except in Prop Cycle (a mouse menu) the stick also moves and `A` / `X` chooses.
 Its **VR** page (in Prop Cycle, the **VR** menu) sets the **screen distance** (0.5 to 5 m; 1.5 m to begin with), the
-**screen size** (100 % is life size: the game's own field of view), the **3D depth** (0 is a flat screen) and
-**recenters** the screen. They are saved by themselves.
+**screen size** (100 % is life size: the game's own field of view), the **3D depth** (0 is a flat screen; 100 % is
+life size, and more than that pushes the far distance past what the eyes can comfortably look into) and **recenters**
+the screen. They are saved by themselves.
 
 **Time Crisis:**
 
@@ -354,8 +355,8 @@ so each game's controller buttons work as they do on a pad.
 | `X` / `Y` | | — / view | Left gun trigger / start | Shift down / up |
 | Grips (left / right) | Service / — | Shift down / up | Left / right gun trigger | Shift down / up |
 
-- The 3D follows the game's camera: a zoomed-in shot (a replay's telephoto, a close-up) has less depth, so the far
-  world never goes past the distance your eyes can comfortably look into.
+- The 3D follows the game's camera: a zoomed-in shot (a replay's telephoto, a close-up) has less depth, so its far
+  world goes no farther than the game's normal view puts it.
 - On Linux the game talks to the headset through X11 (XWayland on a Wayland desktop): OpenXR's OpenGL link on Linux needs it.
 - On Windows `openxr_loader.dll` sits next to the games; only `--vr` uses it.
 - Tested on Windows with a real headset (Time Crisis), and all five games in the [OpenXR Simulator](https://github.com/webhead2oo9/OpenXR-Simulator) under Wine.

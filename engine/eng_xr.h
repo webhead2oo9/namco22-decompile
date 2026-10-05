@@ -49,9 +49,9 @@ bool eng_xr_running(void);                 /* the session is showing frames: eng
 void eng_xr_poll(void);
 
 /* THE EYES' STEREO for the game's renderer, from the settings: sep = the eyes' distance, zconv = the depth on the screen's plane, both
- * in the game's view-space units (engine/slave_list.h eng_eye: eye 0 at dx = -sep / 2, eye 1 at +sep / 2), and focal_max = the focal
- * length (pixels) whose infinity is the eyes' own separation on the headset's screen -- the game's life-size lens at screen size
- * 100 %, shorter on a bigger screen (a longer lens, a zoom, has its eyes moved in: eng_eye.focal_max) */
+ * in the game's view-space units (engine/slave_list.h eng_eye: eye 0 at dx = -sep / 2, eye 1 at +sep / 2), and focal_max = the
+ * game's life-size lens (pixels) on the headset's screen -- shorter on a bigger screen. A longer lens, a zoom, has its eyes moved in
+ * (eng_eye.focal_max), so its far world goes no farther than the game's own lens puts it: infinity at 3D depth 100 %. */
 void eng_xr_stereo(int32_t *sep, int32_t *zconv, float *focal_max);
 
 /* ONE HOST FRAME IN THE HEADSET. draw_eye(eye, w, h, u) draws the game's picture for that eye (0 left, 1 right) into the bound eye
