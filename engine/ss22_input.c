@@ -10,6 +10,7 @@
 #include "ss22_board.h"
 #include "ss22_gl.h"
 #include "eng_display.h"
+#include "eng_xr.h"
 
 #define PAD_DEADZONE   4000     /* of 32767: an Xbox pad rests near 3000. 8000 left a quarter of the stick dead, and with the curve below the steering
                                 * all came in the stick's outer half -- easing off a turn dropped it back towards the centre */
@@ -213,10 +214,12 @@ void ss22_input_close(void) { eng_ffb_close(); }
 typedef struct { SDL_GameController *gc; SDL_JoystickID id; } pad_dev;
 static pad_dev pads[MAX_DEV];
 
-/* a short kick on every connected game pad (the gun's recoil solenoid; a Steam Deck's own motors included). A pad without rumble ignores it. */
+/* a short kick on every connected game pad (the gun's recoil solenoid; a Steam Deck's own motors included), and on a VR headset's gun
+ * hand. A pad without rumble ignores it. */
 void ss22_input_rumble(uint16_t low, uint16_t high, uint32_t ms)
 {
     for (int i = 0; i < MAX_DEV; i++) if (pads[i].gc) SDL_GameControllerRumble(pads[i].gc, low, high, ms);
+    eng_xr_rumble((low > high ? low : high) / 65535.0f, ms);
 }
 
 static int pad_find(SDL_JoystickID id)
@@ -660,18 +663,18 @@ static bool raw_pedal_value(raw_axis_bind *b, pedal_cal *cal, int *out)
     return true;
 }
 
-/* ---- the light gun: where it points, from the mouse, the right stick or the arrow keys ------------------------------------------ */
+/* ---- the light gun: where it points, from a VR controller, the mouse, the right stick or the arrow keys ------------------------------ */
 #include "ss22_board.h"
 #include "ss22_host.h"
 static float aim_x = 0.5f, aim_y = 0.5f;
 static bool  aim_on;                                    /* the crosshair is on the picture */
-static int   aim_src;                                   /* 0 none yet, 1 mouse, 2 stick / keys */
+static int   aim_src;                                   /* 0 none yet, 1 mouse, 2 stick / keys, 3 a VR controller */
 bool ss22_input_aim(float *nx, float *ny) { if (!game || !game->light_gun || !aim_on) return false; *nx = aim_x; *ny = aim_y; return true; }
 static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
-static void aim_update(const uint8_t *k)
+/* the mouse pointer, either stick or the arrow keys */
+static void aim_from_pointer(const uint8_t *k, int mx, int my)
 {
     static int last_mx = -1, last_my = -1;
-    int mx, my; const uint32_t mb_now = SDL_GetMouseState(&mx, &my);
     float px, py; bool inside;
     const bool have = ss22_host_pointer(&px, &py, &inside);
     if (have && (mx != last_mx || my != last_my)) { aim_src = 1; last_mx = mx; last_my = my; }
@@ -702,12 +705,23 @@ static void aim_update(const uint8_t *k)
         aim_on = have && inside;                        /* the pointer left the picture: the gun is off-screen (a reload shot) */
         if (have) { aim_x = clamp01(px); aim_y = clamp01(py); }
     } else if (aim_src == 0) aim_on = false;
+}
+
+static void aim_update(const uint8_t *k)
+{
+    int mx, my; const uint32_t mb_now = SDL_GetMouseState(&mx, &my);
+    float vx, vy; bool vin;
+    if (eng_xr_gun(&vx, &vy, &vin)) { aim_src = 3; aim_on = vin; aim_x = clamp01(vx); aim_y = clamp01(vy); }   /* a VR controller, while it is tracked: its ray on the headset's screen */
+    else { if (aim_src == 3) aim_src = 0; aim_from_pointer(k, mx, my); }                                       /* (gone: the mouse, a stick or the keys again) */
     if ((mb_now & SDL_BUTTON_X1MASK) || k[SDL_SCANCODE_R]) aim_on = false;     /* an "aim off-screen" button / key (a reload without moving the gun) */
     g_ss22_gun_off = !aim_on;
     g_ss22_gun_x = (uint16_t)(68 + aim_x * 626);        /* the cabinet's port ranges (engine/ss22_board.h) */
     g_ss22_gun_y = (uint16_t)(43 + aim_y * 241);
-    { static int dbg = -1, n; if (dbg < 0) dbg = getenv("SS22_AIMDBG") != NULL;       /* SS22_AIMDBG=1: the aim, once a second */
-      if (dbg && ++n % 60 == 0) fprintf(stderr, "[AIM] src %d on %d  norm %.3f,%.3f  port %u,%u  buttons 0x%X\n", aim_src, aim_on, aim_x, aim_y, g_ss22_gun_x, g_ss22_gun_y, SDL_GetMouseState(NULL, NULL)); } 
+    { static int dbg = -1, n; static unsigned xb_prev; if (dbg < 0) dbg = getenv("SS22_AIMDBG") != NULL;       /* SS22_AIMDBG=1: the aim, once a second; a VR controller's buttons as they change */
+      if (dbg && ++n % 60 == 0) fprintf(stderr, "[AIM] src %d on %d  norm %.3f,%.3f  port %u,%u  buttons 0x%X\n", aim_src, aim_on, aim_x, aim_y, g_ss22_gun_x, g_ss22_gun_y, SDL_GetMouseState(NULL, NULL));
+      const unsigned xb = eng_xr_buttons();
+      if (dbg && xb != xb_prev) { fprintf(stderr, "[AIM] VR buttons %s%s%s  aim %s %.3f,%.3f\n", xb & ENG_XR_TRIGGER ? "trigger " : "", xb & ENG_XR_PEDAL ? "pedal " : "",
+                                          xb & ENG_XR_COIN ? "coin " : "", aim_on ? "on" : "off", aim_x, aim_y); xb_prev = xb; } }
 }
 
 static uint16_t swallow;                 /* buttons held since the menu closed: masked until released */
@@ -718,12 +732,14 @@ void ss22_input_update(void)
     const uint8_t *k = SDL_GetKeyboardState(NULL);
     uint16_t p = 0;
     int left = 0, right = 0, pk[2] = { 0, 0 };
-    const uint32_t mb = game->light_gun ? SDL_GetMouseState(NULL, NULL) : 0;
+    const unsigned xb = eng_xr_buttons();               /* a VR headset's controllers: trigger and grip are the gun's two buttons, A / X the coin */
+    const uint32_t mb = game->light_gun ? SDL_GetMouseState(NULL, NULL) | (xb & ENG_XR_TRIGGER ? SDL_BUTTON_LMASK : 0u) | (xb & ENG_XR_PEDAL ? SDL_BUTTON_RMASK : 0u) : 0;
     if (game->light_gun) aim_update(k);
 
     for (int a = 0; a < game->n; a++) {
         const ss22_action *ac = &game->actions[a];
-        const bool held = key_held(k, a) || raw_button_held(a) || (ac->mouse && (mb & ac->mouse));
+        const bool held = key_held(k, a) || raw_button_held(a) || (ac->mouse && (mb & ac->mouse)) ||
+                          ((xb & ENG_XR_COIN) && (ac->pad & SS22_PAD(SDL_CONTROLLER_BUTTON_BACK)));   /* the pads' Back is every game's coin */
         if (ac->bit && ac->bit == game->test_bit) {
             if (held && !test_prev[a]) { test_latch = !test_latch; fprintf(stderr, "[INPUT] test switch %s\n", test_latch ? "ON" : "OFF"); }
             test_prev[a] = held;

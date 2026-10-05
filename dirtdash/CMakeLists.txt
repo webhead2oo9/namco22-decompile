@@ -99,7 +99,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen/c25.cov AND EXISTS ${CMAKE_CURRE
 set(DD_CPU_SRC ${DD_CORE_SRC} gen/dd_c25.c gen/dd_snd_driver.c)
 add_executable(dd ${DD_CPU_SRC})
 target_compile_options(dd PRIVATE -Wall)
-target_link_libraries(dd ${SDL2_LIBRARIES} ${DD_GL_LIB} ZLIB::ZLIB m)
+target_link_libraries(dd ${SDL2_LIBRARIES} ${DD_GL_LIB} ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 endif()
 
 # Development builds (the instruction trace and the translation gate): only when their sources are present -- the public tree
@@ -116,12 +116,12 @@ add_executable(dd_oracle ${DD_CORE_SRC} ${DD_C25_SRC} ${NAMCO22_C25_ORACLE_SRC}
     ${NAMCO22_TOOLS_DIR}/sndoracle/m37710.c ${NAMCO22_TOOLS_DIR}/sndoracle/sound_oracle.c)
 target_compile_options(dd_oracle PRIVATE -Wall)
 target_compile_definitions(dd_oracle PRIVATE DD_ORACLE SS22_ORACLE C25_DEV_HOOKS ${DD_C25_DEFS})
-target_link_libraries(dd_oracle ${SDL2_LIBRARIES} OpenGL::GL ZLIB::ZLIB m)
+target_link_libraries(dd_oracle ${SDL2_LIBRARIES} OpenGL::GL ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 
 # instruction-trace build: every instruction logs PC + D0-D7/A0-A7 (RR_TRACE_FILE); the T3 proof against MAME's register trace
 add_executable(dd_trace ${DD_CORE_SRC} ${DD_C25_SRC} ${NAMCO22_C25_ORACLE_SRC}
     ${NAMCO22_TOOLS_DIR}/sndoracle/m37710.c ${NAMCO22_TOOLS_DIR}/sndoracle/sound_oracle.c)
 target_compile_options(dd_trace PRIVATE -Wall)
 target_compile_definitions(dd_trace PRIVATE RR_TRACE DD_ORACLE SS22_ORACLE C25_DEV_HOOKS ${DD_C25_DEFS})
-target_link_libraries(dd_trace ${SDL2_LIBRARIES} OpenGL::GL ZLIB::ZLIB m)
+target_link_libraries(dd_trace ${SDL2_LIBRARIES} OpenGL::GL ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 endif()

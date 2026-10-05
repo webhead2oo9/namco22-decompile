@@ -75,7 +75,7 @@ set(TC_CORE_SRC src/tc_game.c
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen/snd.cov)
 add_executable(tc ${TC_CORE_SRC} gen/tc_snd_driver.c)
 target_compile_options(tc PRIVATE -Wall)
-target_link_libraries(tc ${SDL2_LIBRARIES} ${TC_GL_LIB} ZLIB::ZLIB m)
+target_link_libraries(tc ${SDL2_LIBRARIES} ${TC_GL_LIB} ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 endif()
 
 # DEV builds (HARD RULE 2: the DSP and the sound MCU INTERPRETED, never shipped): the window / headless run, and the instruction trace for the T3 proof
@@ -84,11 +84,11 @@ add_executable(tc_oracle ${TC_CORE_SRC} ${NAMCO22_C25_ORACLE_SRC}
     ${NAMCO22_TOOLS_DIR}/sndoracle/m37710.c ${NAMCO22_TOOLS_DIR}/sndoracle/sound_oracle.c)
 target_compile_options(tc_oracle PRIVATE -Wall)
 target_compile_definitions(tc_oracle PRIVATE TC_ORACLE SS22_ORACLE C25_DEV_HOOKS)
-target_link_libraries(tc_oracle ${SDL2_LIBRARIES} ${TC_GL_LIB} ZLIB::ZLIB m)
+target_link_libraries(tc_oracle ${SDL2_LIBRARIES} ${TC_GL_LIB} ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 
 add_executable(tc_trace ${TC_CORE_SRC} ${NAMCO22_C25_ORACLE_SRC}
     ${NAMCO22_TOOLS_DIR}/sndoracle/m37710.c ${NAMCO22_TOOLS_DIR}/sndoracle/sound_oracle.c)
 target_compile_options(tc_trace PRIVATE -Wall)
 target_compile_definitions(tc_trace PRIVATE RR_TRACE TC_ORACLE SS22_ORACLE C25_DEV_HOOKS)
-target_link_libraries(tc_trace ${SDL2_LIBRARIES} ${TC_GL_LIB} ZLIB::ZLIB m)
+target_link_libraries(tc_trace ${SDL2_LIBRARIES} ${TC_GL_LIB} ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 endif()

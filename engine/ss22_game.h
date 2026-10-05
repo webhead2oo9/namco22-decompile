@@ -82,6 +82,9 @@ typedef struct ss22_game {
     unsigned    pedal_full[2];               /* what --pedal F holds the first pedal at */
     void (*frame)(long n);                   /* once a frame at the frame boundary, in every mode (the game's test switches); NULL = none */
     const struct eng_ui_page *(*menu_page)(void);   /* the game's own page in the Esc menu (Time Crisis: Stages); NULL = none */
+    /* the game's view-space units in a metre: a VR headset's eye distance and screen depth (engine/eng_xr.h). Measured from a figure of
+     * known height at a known depth (focal length x height / pixels); 0 = 15000, Time Crisis' scale, not measured for the game */
+    int32_t units_per_m;
 } ss22_game;
 
 /* Run the game's start script NAME (ss22_game.start) from now: its frame n counts from this call. The Esc menu's way to --stage. */

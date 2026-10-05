@@ -226,6 +226,7 @@ static const ss22_game game = {
     .autoplay = autoplay,
     .start = start, .start_names = "1, 2, 3",
     .frame = tc_frame,
+    .units_per_m = 15000,                    /* the warehouse's first soldier: 23 000 units tall at 89 000 deep, 230 px of a 772.6 px focal length */
 };
 
 int main(int argc, char **argv) { return ss22_main(argc, argv, &game); }

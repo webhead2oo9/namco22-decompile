@@ -97,7 +97,7 @@ set(TW_CPU_SRC ${TW_CORE_SRC} gen/tw_snd_driver.c)
 
 add_executable(tw ${TW_CPU_SRC})
 target_compile_options(tw PRIVATE -Wall)
-target_link_libraries(tw ${SDL2_LIBRARIES} ${TW_GL_LIB} ZLIB::ZLIB m)
+target_link_libraries(tw ${SDL2_LIBRARIES} ${TW_GL_LIB} ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 
 # Development builds (the instruction trace and the translation gate): only when their sources are present -- the public tree
 # has just the game.
@@ -106,7 +106,7 @@ if(EXISTS ${NAMCO22_TOOLS_DIR}/sndoracle/sound_oracle.c)
 add_executable(tw_trace ${TW_CPU_SRC})
 target_compile_options(tw_trace PRIVATE -Wall)
 target_compile_definitions(tw_trace PRIVATE RR_TRACE)
-target_link_libraries(tw_trace ${SDL2_LIBRARIES} OpenGL::GL ZLIB::ZLIB m)
+target_link_libraries(tw_trace ${SDL2_LIBRARIES} OpenGL::GL ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 
 # THE TRANSLATION GATE / COVERAGE BUILD (dev only, never shipped -- HARD RULE 1): the same host with
 # the interpreter oracle linked in. TW_C25=oracle runs the program through it (C71_COV=file records
@@ -118,5 +118,5 @@ add_executable(tw_oracle ${TW_CORE_SRC} ${NAMCO22_C25_ORACLE_SRC}
     ${NAMCO22_TOOLS_DIR}/sndoracle/m37710.c ${NAMCO22_TOOLS_DIR}/sndoracle/sound_oracle.c)
 target_compile_options(tw_oracle PRIVATE -Wall)
 target_compile_definitions(tw_oracle PRIVATE TW_ORACLE SS22_ORACLE C25_DEV_HOOKS)
-target_link_libraries(tw_oracle ${SDL2_LIBRARIES} OpenGL::GL ZLIB::ZLIB m)
+target_link_libraries(tw_oracle ${SDL2_LIBRARIES} OpenGL::GL ZLIB::ZLIB m ${CMAKE_DL_LIBS})
 endif()

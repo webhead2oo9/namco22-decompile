@@ -33,6 +33,23 @@
 static geo_quad *qbuf;
 static int       qn, qcap, qorder;
 
+/* STEREO (ss22_set_stereo): the right eye's sorted quads; qbuf holds the left eye's (or the one camera's). eye_swap trades the two, so
+ * the walk, the sort and the draw use one set of names for either eye. */
+static geo_quad *qbuf_r;
+static int       qn_r, qcap_r;
+static int32_t   st_sep, st_zconv;            /* the next prepare's eyes (0 = the game's camera) */
+static bool      st_frame;                    /* the prepared frame has two eyes */
+static float     st_focal;                    /* its full-frame viewport's focal length (0 = no world this frame) */
+static void eye_swap(void)
+{
+    geo_quad *b = qbuf; qbuf = qbuf_r; qbuf_r = b;
+    int n = qn; qn = qn_r; qn_r = n;
+    n = qcap; qcap = qcap_r; qcap_r = n;
+}
+static int32_t eye_dx(int eye) { return eye ? st_sep - st_sep / 2 : -(st_sep / 2); }   /* the pair's two halves add up to st_sep */
+void ss22_set_stereo(int32_t sep, int32_t zconv) { st_sep = sep > 0 ? sep : 0; st_zconv = zconv; }
+bool ss22_stereo_frame(void) { return st_frame; }
+
 static void push_quad(const geo_quad *q, void *user)
 {
     (void)user;
@@ -143,11 +160,21 @@ void ss22_prepare(const ss22_regs *r)
                         items[i].w, items[i].h, items[i].idx, items[i].tile, items[i].prioverchar ? "  prio" : "");
     }
 
-    qn = 0; qorder = 0;
+    qn = 0; qorder = 0; qn_r = 0;
+    st_frame = st_sep > 0; st_focal = 0;
     if (r->walk) {
-        eng_list_cfg cfg = { ENG_LIST_HEAD_SS22, 0, NULL, NULL, NULL, NULL };
+        eng_eye eye[2] = { { eye_dx(0), st_zconv, 0 }, { eye_dx(1), st_zconv, 0 } };
+        eng_list_cfg cfg = { ENG_LIST_HEAD_SS22, 0, NULL, NULL, NULL, NULL, st_frame ? &eye[0] : NULL };
         eng_walk_list(r->poly_word, &cfg, push_quad, NULL);
         eng_quad_sort(qbuf, qn, 0);
+        if (st_frame) {                          /* the right eye: the same list again (the walk only reads polygon RAM and the point ROM) */
+            eye_swap();
+            qn = 0; qorder = 0; cfg.eye = &eye[1];
+            eng_walk_list(r->poly_word, &cfg, push_quad, NULL);
+            eng_quad_sort(qbuf, qn, 0);
+            eye_swap();
+            st_focal = eye[0].focal;
+        }
     }
     ss22_qhist_report();
     ss22_cliplog_report();
@@ -224,8 +251,9 @@ static void tex_alloc(GLuint *t)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SPR_W, SPR_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 }
 
-/* one sprite in its turn of the merged z order: rendered into the corner of one 640x480 texture, sub-imaged, blended */
-static void draw_sprite(const sprite_item *it)
+/* one sprite in its turn of the merged z order: rendered into the corner of one 640x480 texture, sub-imaged, blended; par = its stereo
+ * parallax (scene units, 0 = flat on the screen's plane) */
+static void draw_sprite(const sprite_item *it, float par)
 {
     if (!spr_buf && !(spr_buf = malloc((size_t)SPR_W * SPR_H * 4))) return;
     sprite_render_item(&sst, &g_fog, it, spr_buf, 1);
@@ -245,11 +273,12 @@ static void draw_sprite(const sprite_item *it)
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
     /* widescreen: a HUD sprite goes out to its side (a sprite that is deep in the world, a billboard, stays where the 3D puts it) */
     const int dx = (g_eng_hud_e && hud_cfg && (int)(it->z & 0x1FFFFF) <= hud_cfg->sprite_zmax) ? eng_hud_dx(it->x0 + it->w / 2.0) : 0;
+    const float x0 = (float)(it->x0 + dx) + par, x1 = x0 + (float)it->w;
     glBegin(GL_QUADS);
-    glTexCoord2f(0,  0);  glVertex2f((float)(it->x0 + dx),          (float)it->y0);
-    glTexCoord2f(su, 0);  glVertex2f((float)(it->x0 + it->w + dx), (float)it->y0);
-    glTexCoord2f(su, sv); glVertex2f((float)(it->x0 + it->w + dx), (float)(it->y0 + it->h));
-    glTexCoord2f(0,  sv); glVertex2f((float)(it->x0 + dx),          (float)(it->y0 + it->h));
+    glTexCoord2f(0,  0);  glVertex2f(x0, (float)it->y0);
+    glTexCoord2f(su, 0);  glVertex2f(x1, (float)it->y0);
+    glTexCoord2f(su, sv); glVertex2f(x1, (float)(it->y0 + it->h));
+    glTexCoord2f(0,  sv); glVertex2f(x0, (float)(it->y0 + it->h));
     glEnd();
     glDisable(GL_BLEND);
     glEnable(GL_ALPHA_TEST);
@@ -457,7 +486,27 @@ static void draw_text(void)
     glDisable(GL_TEXTURE_2D);
 }
 
-void ss22_draw(int vw, int vh)
+/* STEREO: a sprite deeper than the HUD's is a billboard in the world: it takes the parallax a point at its depth gets from the eye's
+ * frustum (slave_list.h), dx * f * (1/zconv - 1/z). The HUD's sprites, and every sprite of a frame with no world, stay on the screen. */
+static float sprite_parallax(const sprite_item *it, int eye)
+{
+    const int32_t z = (int32_t)(it->z & 0x1FFFFF);
+    if (!st_frame || st_focal <= 0.0f || z <= (hud_cfg ? hud_cfg->sprite_zmax : 0) || z <= 0) return 0.0f;
+    const double inv_zc = st_zconv > 0 ? 1.0 / st_zconv : 0.0;
+    return (float)(eye_dx(eye) * (double)st_focal * (inv_zc - 1.0 / z));
+}
+
+static void draw_frame(int vw, int vh, int eye);
+void ss22_draw(int vw, int vh) { draw_frame(vw, vh, 0); }
+void ss22_draw_eye(int eye, int vw, int vh)
+{
+    const bool right = st_frame && eye == 1;
+    if (right) eye_swap();
+    draw_frame(vw, vh, right ? 1 : 0);
+    if (right) eye_swap();
+}
+
+static void draw_frame(int vw, int vh, int eye)
 {
     if (!g_eng_pointrom) return;
     if (!gl_ready) { renderer_texture_init(); gl_ready = true; }
@@ -509,7 +558,7 @@ void ss22_draw(int vw, int vh)
     while (qi < qn || si < ni) {
         const uint32_t qz = qi < qn ? (uint32_t)(qbuf[qi].zsort & 0xFFFFFF) : 0;
         const uint32_t sz = si < ni ? items[si].z : 0;
-        if (si < ni && (qi >= qn || sz >= qz)) { eng_draw_end(); draw_sprite(&items[si++]); eng_draw_resume(); }
+        if (si < ni && (qi >= qn || sz >= qz)) { eng_draw_end(); draw_sprite(&items[si], sprite_parallax(&items[si], eye)); si++; eng_draw_resume(); }
         else eng_draw_quad(&qbuf[qi++], &cfg);
     }
     eng_draw_end();

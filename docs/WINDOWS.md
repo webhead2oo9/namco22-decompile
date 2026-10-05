@@ -4,8 +4,11 @@ The Windows programs are built from Linux with `./build-windows.sh` (MinGW-w64).
 itself in an MSYS2 *MINGW64* shell: install `mingw-w64-x86_64-toolchain`, `mingw-w64-x86_64-cmake`,
 `mingw-w64-x86_64-pkgconf`, `mingw-w64-x86_64-SDL2`, `mingw-w64-x86_64-zlib`, `mingw-w64-x86_64-python` and
 `mingw-w64-x86_64-python-numpy`. SDL2, zlib and the C runtime are linked into the `.exe`, so it needs no DLL beside it
-(zlib's static library is picked on its own with CMake 3.24 or newer). Either way, a game's ROM files must be unpacked in
-its `extracted/` folder before building: its sound and DSP programs are translated from them at build time.
+(zlib's static library is picked on its own with CMake 3.24 or newer). The one exception is VR: `--vr` loads
+`openxr_loader.dll` (the Khronos OpenXR loader, Apache-2.0) from beside the `.exe` at run time; `build-windows.sh` downloads
+it into the release with its licence, and without it the game says so and stays in its window. Either way, a game's ROM
+files must be unpacked in its `extracted/` folder before building: its sound and DSP programs are translated from them at
+build time.
 
 `include/win_compat.h` maps the few POSIX calls the code uses onto Windows.
 

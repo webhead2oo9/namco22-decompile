@@ -8,6 +8,7 @@
  *   <game> <rom_dir> [--frames N] [--ppf N] [--dump DIR [--dump-every N]]
  *   <game> <rom_dir> --window [N] [--fullscreen]          play: OpenGL window (Nx the 640x480 picture), sound card, keyboard and pads
  *   <game> <rom_dir> --window [N] --stage NAME             ... starting at that stage: the game's start script plays coins, stage and car, then the player has the cabinet
+ *   <game> <rom_dir> --vr [--window N]                     ... and in an OpenXR headset: a 3D screen in front of you (engine/eng_xr.h); the window shows the left eye
  *   <game>                                                (no arguments: a double-click) the same window
  *   <game> <rom_dir> --shots DIR N [--frames M]           headless: a 640x480 PPM every N frames (offscreen OpenGL)
  *   <game> <rom_dir> --render-dump DIR FRAME OUT.ppm      MAME's captured video state (tools/mame/vid_dump.lua) through the engine
@@ -50,7 +51,7 @@ static int32_t  polls_per_frame;           /* 68K instructions per frame: the ga
 static uint32_t max_frames = 600;
 static const char *dump_dir;
 static uint32_t dump_every, dump_wram_only;          /* --dump-every N: work RAM alone, every N frames (finding a game's mode word) */
-static int  win_scale, win_full, shot_every;       /* --window, --fullscreen, --shots */
+static int  win_scale, win_full, shot_every, vr;   /* --window, --fullscreen, --shots, --vr */
 static const char *shot_dir;
 static bool video_on;
 
@@ -447,7 +448,7 @@ int ss22_main(int argc, char **argv, const ss22_game *g)
     extern bool ss22_input_aim(float *, float *);
     host_game = (ss22_host_game){ g->name, cfgfile, g->tag, g->lname, in_init, ss22_input_page, ss22_input_event, in_update,
                                   ss22_input_neutral, ss22_snd_set_output, g->out_gain,
-                                  g->input && g->input->light_gun ? ss22_input_aim : NULL, g->menu_page };
+                                  g->input && g->input->light_gun ? ss22_input_aim : NULL, g->menu_page, g->units_per_m };
     const char *rom_dir = "extracted";
     const char *rd_dir = NULL, *rd_out = NULL; int rd_frame = 0, frames_given = 0;
     if (argc == 1) win_scale = -1;                      /* started with no arguments (a double-click, the Windows how-to): play, in a window */
@@ -455,6 +456,7 @@ int ss22_main(int argc, char **argv, const ss22_game *g)
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) { max_frames = (uint32_t)atoi(argv[++i]); frames_given = 1; }
         else if (!strcmp(argv[i], "--window")) { win_scale = (i + 1 < argc && atoi(argv[i + 1]) > 0) ? atoi(argv[++i]) : -1; }   /* -1: the saved size */
         else if (!strcmp(argv[i], "--fullscreen")) { win_full = 1; if (!win_scale) win_scale = -1; }
+        else if (!strcmp(argv[i], "--vr")) { vr = 1; if (!win_scale) win_scale = -1; }          /* a headset: a window too (it shows the left eye) */
         else if (!strcmp(argv[i], "--shots") && i + 2 < argc) { shot_dir = argv[++i]; shot_every = atoi(argv[++i]); if (shot_every < 1) shot_every = 1; }
         else if (!strcmp(argv[i], "--render-dump") && i + 3 < argc) { rd_dir = argv[++i]; rd_frame = atoi(argv[++i]); rd_out = argv[++i]; }
         else if (!strcmp(argv[i], "--ppf") && i + 1 < argc) polls_per_frame = atoi(argv[++i]);
@@ -522,7 +524,7 @@ int ss22_main(int argc, char **argv, const ss22_game *g)
     ss22_env_init(getenv(envname));                     /* dev trace build only */
     if (win_scale || shot_dir) {                        /* video: a window, or offscreen for --shots */
         if (win_scale && !frames_given) max_frames = 0xFFFFFFFFu;
-        video_on = ss22_video_init(rom_dir) && (win_scale ? ss22_host_open(&host_game, win_scale, win_full) : ss22_host_open_headless());
+        video_on = ss22_video_init(rom_dir) && (win_scale ? ss22_host_open(&host_game, win_scale, win_full, vr) : ss22_host_open_headless());
         if (!video_on) { fprintf(stderr, "[%s] no picture: video could not start\n", g->tag); if (win_scale) return 2; }
     }
     memset(R, 0, RR_REGSPACE);

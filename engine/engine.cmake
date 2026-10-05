@@ -40,6 +40,7 @@ set(NAMCO22_ENGINE_SS22_HOST_SRC
     ${NAMCO22_ENGINE_DIR}/ss22_video.c
     ${NAMCO22_ENGINE_DIR}/ss22_env.c
     ${NAMCO22_ENGINE_DIR}/ss22_run.c
+    ${NAMCO22_ENGINE_DIR}/eng_xr.c       # --vr: OpenXR, its loader found at run time (headers: third_party/openxr); link CMAKE_DL_LIBS
 )
 # THE MENU AND THE DISPLAY CHOICES (Nuklear): a settings file, the display modes (widescreen, window mode/size, resolution,
 # aspect, scaling) and the menu bar every game's Escape menu is. Its own list because eng_ui.c defines Nuklear's

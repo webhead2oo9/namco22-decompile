@@ -25,6 +25,7 @@ cd "$(dirname "$0")"
 SDL_VER=2.32.10
 ZLIB_VER=1.3.1
 MESA_VER=26.2.1
+OPENXR_VER=1.1.63
 CC=x86_64-w64-mingw32-gcc
 TOP="$PWD"
 DEPS="$TOP/build-win/deps"
@@ -64,6 +65,16 @@ if [ ! -f "$MESA/libgallium_wgl.dll" ]; then
         "https://github.com/pal1000/mesa-dist-win/releases/download/$MESA_VER/mesa3d-$MESA_VER-release-mingw.7z"
     mkdir -p "$MESA"
     7z e -y -o"$MESA" "$DEPS/mesa.7z" x64/opengl32.dll x64/libgallium_wgl.dll >/dev/null
+fi
+
+# --- the OpenXR loader (--vr: the games load it at run time from beside the .exe; Khronos' build, static C runtime) --
+OXR="$DEPS/openxr-$OPENXR_VER"
+if [ ! -f "$OXR/openxr_loader.dll" ]; then
+    echo "Downloading the OpenXR loader $OPENXR_VER..."
+    curl -fsSL -o "$DEPS/openxr_loader_windows.zip" \
+        "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$OPENXR_VER/openxr_loader_windows-$OPENXR_VER.zip"
+    mkdir -p "$OXR"
+    7z e -y -o"$OXR" "$DEPS/openxr_loader_windows.zip" x64/bin/openxr_loader.dll share/doc/openxr/LICENSE >/dev/null
 fi
 
 # --- cross-compile -----------------------------------------------------------
@@ -116,6 +127,8 @@ cp build-win/dd/dd.exe "$REL/DirtDash.exe"
 cp build-win/tc/tc.exe "$REL/TimeCrisis.exe"
 mkdir -p "$REL/mesa"
 cp "$MESA/opengl32.dll" "$MESA/libgallium_wgl.dll" "$REL/mesa/"
+cp "$OXR/openxr_loader.dll" "$REL/"                       # --vr (Apache-2.0, its licence beside it)
+cp "$OXR/LICENSE" "$REL/OpenXR-LICENSE.txt"
 x86_64-w64-mingw32-strip "$REL/PropCycle.exe" "$REL/RaveRacer.exe" "$REL/TokyoWars.exe" "$REL/DirtDash.exe" "$REL/TimeCrisis.exe"
 # the .exe must need nothing beside it: every DLL it imports must ship with Windows
 # (OPENGL32.dll does -- it hands over to the installed GPU driver and is never bundled)

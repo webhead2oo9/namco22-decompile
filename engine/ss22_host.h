@@ -6,6 +6,7 @@
 #ifndef ENG_SS22_HOST_H
 #define ENG_SS22_HOST_H
 #include <stdbool.h>
+#include <stdint.h>
 #include <SDL2/SDL.h>
 #include "eng_ui.h"
 
@@ -23,9 +24,11 @@ typedef struct {
     double out_gain;                         /* the game's speaker gain (engine/audio_out.h); 0 = the shared default */
     bool (*aim)(float *nx, float *ny);       /* a LIGHT GUN game: where the gun points in the 4:3 picture (false = off-screen); the host draws the crosshair and hides the pointer */
     const eng_ui_page *(*extra_page)(void);  /* the game's own menu page after Controls (Time Crisis: Stages); NULL = none */
+    int32_t units_per_m;                     /* the game's view-space units in a metre, for a VR headset's stereo (engine/eng_xr.h); 0 = 15000 */
 } ss22_host_game;
 
-bool ss22_host_open(const ss22_host_game *g, int scale, bool fullscreen);   /* a real window; scale <= 0 = the saved window size */
+/* a real window; scale <= 0 = the saved window size. vr: the picture in an OpenXR headset as well (engine/eng_xr.h), when one is there */
+bool ss22_host_open(const ss22_host_game *g, int scale, bool fullscreen, bool vr);
 bool ss22_host_open_headless(void);                                          /* an offscreen GL context, for --shots and --render-dump */
 bool ss22_host_restart_requested(void);                                      /* File > Restart: re-launch the program after the clean-up */
 bool ss22_host_active(void);                                                 /* a window is open (its keyboard drives the cabinet) */

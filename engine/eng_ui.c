@@ -309,6 +309,7 @@ static void note_line(const char *fmt, ...)      /* what a page's notes() calls:
 
 static char hint_text[96]; static int hint_left;
 void eng_ui_set_hint(const char *text, int frames) { snprintf(hint_text, sizeof hint_text, "%s", text ? text : ""); hint_left = frames; }
+bool eng_ui_visible(void) { return ctx && (open_ || (hint_left > 0 && hint_text[0])); }
 
 void eng_ui_draw(bool *quit)
 {

@@ -130,6 +130,18 @@ int eng_walk_list(eng_word_fn pw, const eng_list_cfg *cfg, geo_quad_cb cb, void 
                     gv.t[c] = (int32_t)(((int64_t)t[0] * viewq[0][c] +
                                          (int64_t)t[1] * viewq[1][c] +
                                          (int64_t)t[2] * viewq[2][c]) >> 15);
+                if (cfg->eye && have_clip) {   /* stereo (slave_list.h): a full-frame viewport only -- quad_gl.c's test of one */
+                    const int32_t cx = 320 + vx;
+                    if ((int32_t)((float)cx + cl) <= 0 && (int32_t)((float)cx - cr - 1.0f) >= 639) {
+                        const int64_t dx = cfg->eye->dx, zc = cfg->eye->zconv;
+                        if (zc > 0) {                  /* the shear: + dx * z / zconv, z = the third column (Q15 rows, plain t) */
+                            for (int r = 0; r < 3; r++) gv.m[r][0] += (int32_t)(gv.m[r][2] * dx / zc);
+                            gv.t[0] += (int32_t)(gv.t[2] * dx / zc);
+                        }
+                        gv.t[0] -= (int32_t)dx;
+                        cfg->eye->focal = (float)zoom_mant / (float)(1ull << zoom_shift);
+                    }
+                }
                 gv.zoom_mant = zoom_mant; gv.zoom_shift = zoom_shift;
                 gv.vx = vx; gv.vy = vy;
                 gv.objectshift = objectshift;

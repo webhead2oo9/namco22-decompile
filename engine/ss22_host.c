@@ -26,6 +26,8 @@
 #include "ss22_host.h"
 #include "eng_ffb.h"
 #include "gl_warn.h"
+#include "eng_xr.h"
+#include "quad_gl.h"
 
 #define FRAME_NS 16693000ull                      /* 1 / 59.906 Hz, 25.6 MHz / 814 / 525 */
 
@@ -33,6 +35,8 @@ static const ss22_host_game *game;
 static SDL_Window *win;
 static SDL_GLContext glc;
 static bool vsync, paused, shot_pending, headless_open, restart_req;
+static bool xr_on;                                 /* --vr: an OpenXR session shares the window's GL context (engine/eng_xr.h) */
+static bool stereo_shots;                          /* ENG_STEREO_SHOTS: headless --shots also write each eye */
 static uint64_t next_ns, vs_t0;
 static int vs_frames;
 
@@ -54,10 +58,13 @@ static const char *genv(const char *name)
     return getenv(v);
 }
 
-bool ss22_host_open(const ss22_host_game *g, int scale, bool fs)      /* scale <= 0: the saved window size */
+bool ss22_host_open(const ss22_host_game *g, int scale, bool fs, bool vr)      /* scale <= 0: the saved window size */
 {
     game = g;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifndef _WIN32
+    if (vr && !getenv("SDL_VIDEODRIVER")) SDL_SetHint(SDL_HINT_VIDEODRIVER, "x11");   /* OpenXR's OpenGL on Linux is GLX's (XWayland on a Wayland desktop) */
+#endif
     eng_ffb_start();                                 /* before the joysticks, or Windows never lists a wheel as haptic (engine/eng_ffb.h) */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) { fprintf(stderr, "[HOST] SDL: %s\n", SDL_GetError()); return false; }
     eng_gl_context_attributes();
@@ -88,7 +95,13 @@ bool ss22_host_open(const ss22_host_game *g, int scale, bool fs)      /* scale <
     game->input_init();                            /* after the cfg: the key bindings */
     eng_ui_add_page(game->input_page());
     if (game->extra_page) eng_ui_add_page(game->extra_page());
+    if (vr) {                                        /* the headset: the window shows the left eye, the timer paces the game (xrWaitFrame paces the headset) */
+        xr_on = eng_xr_start(game->title, game->units_per_m, game->aim != NULL);
+        if (xr_on) { vsync = false; SDL_GL_SetSwapInterval(0); eng_ui_add_page(eng_xr_page()); }
+        else fprintf(stderr, "[HOST] no VR: playing in the window\n");
+    }
     if (!eng_ui_init(win, game->title)) fprintf(stderr, "[HOST] menu: Nuklear init failed\n");
+    else if (xr_on) eng_ui_set_hint(ENG_XR_MENU_HINT, 60 * 8);                       /* in the headset: how to reach the menu */
     else if (eng_pad_present()) eng_ui_set_hint(ENG_PAD_MENU_HINT, 60 * 8);         /* a pad has no Esc: say how to reach the menu */
     tex_bake_window_defaults();                    /* a per-frame budget for cold texture bakes (engine/tex_bake.c; ENG_TEX_BUDGET) */
     eng_disp_set_volume_hook(volume_hook);
@@ -106,6 +119,9 @@ bool ss22_host_open_headless(void)
     const char *e = getenv("ENG_SHOT_W");
     if (e && atoi(e) >= 640 && atoi(e) <= 2560) headless_w = atoi(e);
     headless_open = eng_gl_open_headless(headless_w, 480);
+    /* ENG_STEREO_SHOTS=<sep>:<zconv> (tests): the two eyes a headset gets (engine/ss22_gl.h ss22_set_stereo, the game's units); every
+     * --shots picture is the left eye, with <name>_L.ppm and <name>_R.ppm beside it */
+    if ((e = getenv("ENG_STEREO_SHOTS"))) { int s = 0, z = 0; sscanf(e, "%d:%d", &s, &z); ss22_set_stereo(s, z); stereo_shots = s > 0; }
     return headless_open;
 }
 
@@ -122,6 +138,13 @@ void ss22_host_shot(const char *path)
         eng_gl_write_ppm(path, vw, vh);
     } else {
         vw = headless_w; vh = 480;
+        if (stereo_shots && ss22_stereo_frame())
+            for (int eye = 0; eye < 2; eye++) {
+                char p[1024]; const size_t n = strlen(path);
+                snprintf(p, sizeof p, "%.*s_%c.ppm", (int)(n > 4 ? n - 4 : n), path, eye ? 'R' : 'L');
+                ss22_draw_eye(eye, vw, vh);
+                eng_gl_write_ppm(p, vw, vh);
+            }
         ss22_draw(vw, vh);
         eng_gl_write_ppm(path, vw, vh);
     }
@@ -129,15 +152,37 @@ void ss22_host_shot(const char *path)
     if (chk) { fclose(chk); fprintf(stderr, "[HOST] saved %s\n", path); } else fprintf(stderr, "[HOST] could not write %s (does the folder exist?)\n", path);
 }
 
+/* F12's file: screenshots/<prefix>_<date>_<n><suffix>.ppm */
+static void shot_name(char *p, size_t pn, const char *suffix)
+{
+    char t_[32]; time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); static int n;
+    mkdir("screenshots", 0755);
+    strftime(t_, sizeof t_, "%Y%m%d_%H%M%S", &tm);
+    snprintf(p, pn, "screenshots/%s_%s_%d%s.ppm", game->shot_prefix, t_, n++, suffix);
+}
+
+/* the light gun's crosshair at (cx, cy), arms s long, in the current ortho's units: a dark outline under a red cross, readable on any picture */
+static void draw_cross(float cx, float cy, float s)
+{
+    glDisable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_SCISSOR_TEST);
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 0) { glLineWidth(4.0f); glColor3f(0, 0, 0); } else { glLineWidth(2.0f); glColor3f(1, 0.1f, 0.1f); }
+        glBegin(GL_LINES);
+        glVertex2f(cx - s, cy); glVertex2f(cx - s * 0.3f, cy); glVertex2f(cx + s * 0.3f, cy); glVertex2f(cx + s, cy);
+        glVertex2f(cx, cy - s); glVertex2f(cx, cy - s * 0.3f); glVertex2f(cx, cy + s * 0.3f); glVertex2f(cx, cy + s);
+        glEnd();
+    }
+}
+
 /* The prepared frame into the window: the engine draws it at the render size into the shared render target, which is scaled
  * into the picture rectangle; the menu, when open, goes over it. */
 static SDL_Rect pic_r, gun_r;                        /* the last picture rectangle (drawable pixels) and the 4:3 part of it the light gun aims over */
 static eng_pace *pace_log;                           /* set by present_with(): present() times the frame's work into it */
-static void present(void)
+static SDL_Rect present_window(int *rw, int *rh)
 {
-    int rw, rh, vw, vh;
-    eng_disp_render_size(&rw, &rh);
-    rt_begin(win, rw, rh, &vw, &vh);
+    int vw, vh;
+    eng_disp_render_size(rw, rh);
+    rt_begin(win, *rw, *rh, &vw, &vh);
     struct timespec d0, d1; clock_gettime(CLOCK_MONOTONIC, &d0);
     ss22_draw(vw, vh);
     clock_gettime(CLOCK_MONOTONIC, &d1);
@@ -146,17 +191,65 @@ static void present(void)
       if (on && ms > 40.0) fprintf(stderr, "[FTIME-DRAW] ss22_draw %.1f ms\n", ms); }   /* the engine's draw (quads, sprites, text, post) vs the swap below */
     if (shot_pending) {                              /* F12: what the engine drew, before it is scaled to the window */
         shot_pending = false;
-        char p[96]; time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); static int n;
-        mkdir("screenshots", 0755);
-        snprintf(p, sizeof p, "screenshots/%s_%04d%02d%02d_%02d%02d%02d_%d.ppm", game->shot_prefix, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                 tm.tm_hour, tm.tm_min, tm.tm_sec, n++);
+        char p[160]; shot_name(p, sizeof p, "");
         if (eng_gl_write_ppm(p, vw, vh)) fprintf(stderr, "[HOST] saved %s\n", p);
     }
-    const SDL_Rect r = eng_disp_picture_rect(rw, rh);
-    pic_r = r; gun_r = r;
-    if (g_eng_disp.wide) { const int w = (int)(r.h * 4.0 / 3.0 + 0.5); gun_r.x = r.x + (r.w - w) / 2; gun_r.w = w; }   /* the 2D layers and the gun stay 4:3 */
+    const SDL_Rect r = eng_disp_picture_rect(*rw, *rh);
     rt_end_rect(win, r.x, r.y, r.w, r.h, eng_disp_sharp());
-    if (game->aim && g_eng_disp.gun_border) {          /* the light gun's border (Sinden-style guns track it): white, all round the window */
+    return r;
+}
+
+/* THE HEADSET (--vr): each eye into its picture -- the gun's crosshair at the same place in both, ON the screen's plane, where the
+ * aim ray meets it, and the menu over both (drawn once, into the overlay, at the window's size) -- the two pictures to the headset,
+ * the left one into the window (letterboxed to its shape). */
+static SDL_Rect present_xr(int *rw, int *rh)
+{
+    static int ew = 1280, eh = 960;                  /* the last pictures' size */
+    float ax = 0, ay = 0;
+    const bool cross = game->aim && g_eng_disp.crosshair && !eng_ui_is_open() && game->aim(&ax, &ay);
+    if (eng_xr_frame_begin(&ew, &eh)) {
+        int dw, dh; SDL_GL_GetDrawableSize(win, &dw, &dh);
+        if (eng_ui_visible() && eng_xr_overlay_begin(dw, dh)) { bool quit = false; eng_ui_draw(&quit); eng_xr_overlay_end(); }
+        for (int eye = 0; eye < 2; eye++) {
+            eng_xr_eye_target(eye);
+            ss22_draw_eye(eye, ew, eh);
+            if (cross) {                             /* scene units: the 4:3 picture is 0..640 x 0..480 in either shape */
+                glViewport(0, 0, ew, eh);
+                glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(g_scene_x0, g_scene_x1, 480, 0, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+                draw_cross(ax * 640.0f, ay * 480.0f, 20.0f);
+            }
+            eng_xr_overlay_draw();
+        }
+    }
+    eng_xr_frame_end();
+    if (shot_pending) {                              /* F12: both eyes */
+        shot_pending = false;
+        for (int eye = 0; eye < 2; eye++) {
+            char p[160]; shot_name(p, sizeof p, eye ? "_R" : "_L");
+            if (eng_xr_read_eye(eye) && eng_gl_write_ppm(p, ew, eh)) fprintf(stderr, "[HOST] saved %s\n", p);
+        }
+        eng_xr_read_done();
+    }
+    *rw = ew; *rh = eh;
+    int dw, dh; SDL_GL_GetDrawableSize(win, &dw, &dh);
+    const double a = (double)ew / eh;
+    SDL_Rect r = { 0, 0, dw, (int)(dw / a + 0.5) };
+    if (r.h > dh) { r.h = dh; r.w = (int)(dh * a + 0.5); }
+    r.x = (dw - r.w) / 2; r.y = (dh - r.h) / 2;
+    eng_xr_mirror(r.x, r.y, r.w, r.h, eng_disp_sharp());
+    return r;
+}
+
+static void present(void)
+{
+    int rw, rh;
+    const bool xr = xr_on && eng_xr_running();
+    if (xr_on) { int32_t sep = 0, zc = 0; if (xr) eng_xr_stereo(&sep, &zc); ss22_set_stereo(sep, zc); }   /* the eyes, from the next prepare on */
+    const SDL_Rect r = xr ? present_xr(&rw, &rh) : present_window(&rw, &rh);
+    pic_r = r; gun_r = r;
+    if (xr || g_eng_disp.wide) { const int w = (int)(r.h * 4.0 / 3.0 + 0.5); gun_r.x = r.x + (r.w - w) / 2; gun_r.w = w; }   /* the 2D layers and the gun stay 4:3 */
+    if (game->aim && g_eng_disp.gun_border && !xr) {   /* the light gun's border (Sinden-style guns track it): white, all round the window */
         int dw, dh; SDL_GL_GetDrawableSize(win, &dw, &dh);
         const float b = (float)(g_eng_disp.gun_border * (dw < dh ? dw : dh) / 100);
         glViewport(0, 0, dw, dh);
@@ -172,27 +265,19 @@ static void present(void)
         glEnd();
         glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
     }
-    if (game->aim && g_eng_disp.crosshair && !eng_ui_is_open()) {
+    if (game->aim && g_eng_disp.crosshair && !eng_ui_is_open() && !xr) {   /* (in the headset the eyes' pictures carry it) */
         float ax, ay;
         if (game->aim(&ax, &ay)) {                   /* the crosshair, over the picture */
             int dw, dh; SDL_GL_GetDrawableSize(win, &dw, &dh);
-            const float cx = gun_r.x + ax * gun_r.w, cy = gun_r.y + ay * gun_r.h, s = gun_r.h / 24.0f;
             glViewport(0, 0, dw, dh);
             glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0, dw, dh, 0, -1, 1);
             glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
-            glDisable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_SCISSOR_TEST);
-            for (int pass = 0; pass < 2; pass++) {   /* a dark outline under a red cross, readable on any picture */
-                if (pass == 0) { glLineWidth(4.0f); glColor3f(0, 0, 0); } else { glLineWidth(2.0f); glColor3f(1, 0.1f, 0.1f); }
-                glBegin(GL_LINES);
-                glVertex2f(cx - s, cy); glVertex2f(cx - s * 0.3f, cy); glVertex2f(cx + s * 0.3f, cy); glVertex2f(cx + s, cy);
-                glVertex2f(cx, cy - s); glVertex2f(cx, cy - s * 0.3f); glVertex2f(cx, cy + s * 0.3f); glVertex2f(cx, cy + s);
-                glEnd();
-            }
+            draw_cross(gun_r.x + ax * gun_r.w, gun_r.y + ay * gun_r.h, gun_r.h / 24.0f);
             glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
         }
     }   /* clears the window round the picture itself; a no-op when rt_begin drew straight into it */
     bool quit = false;
-    eng_ui_draw(&quit);
+    if (!xr) eng_ui_draw(&quit);                     /* (in the headset the eyes' pictures carry it, and the window mirrors one) */
     { static int dbg = -1, n, shot = -1;             /* <tag>_HOSTDBG=1: what is in the window's back buffer just before it is shown;
                                                       * <tag>_WINSHOT=<n>: that back buffer, whole, to screenshots/<prefix>_window_<n>.ppm at swap n */
       if (dbg < 0) { dbg = genv("HOSTDBG") != NULL; shot = genv("WINSHOT") ? atoi(genv("WINSHOT")) : 0; }
@@ -224,6 +309,12 @@ static void present_with(eng_pace *p) { pace_log = p; present(); pace_log = NULL
 static bool pump(void)
 {
     SDL_Event e;
+    if (xr_on) {
+        eng_xr_poll();                               /* the headset's session and controllers, before the keys */
+        for (char c; (c = eng_xr_menu_key()) != 0; ) /* its menu button and stick */
+            if (c == 'm') { if (!eng_ui_is_open()) { eng_ui_set_open(true); game->input_neutral(); fprintf(stderr, "[HOST] menu open (VR)\n"); } }
+            else if (eng_ui_is_open() && !eng_ui_capturing()) eng_ui_nav(c);
+    }
     eng_ui_input_begin();
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) { eng_ui_input_end(); return false; }
@@ -320,7 +411,8 @@ bool ss22_host_frame(void)
         eng_pace_reset(&pl);
         if (!pump()) return false;
         if (paused || eng_ui_is_open()) {
-            if (eng_ui_is_open()) { present(); if (!vsync) SDL_Delay(12); }
+            const bool xr = xr_on && eng_xr_running();   /* a headset wants its frames all the same (xrWaitFrame paces them) */
+            if (eng_ui_is_open() || xr) { present(); if (!vsync && !xr) SDL_Delay(12); }
             else SDL_Delay(10);
         }
         if (!paused && !eng_ui_is_open()) next_ns = now_ns();
@@ -331,6 +423,8 @@ bool ss22_host_frame(void)
 void ss22_host_close(void)
 {
     eng_audio_close();
+    if (xr_on) eng_xr_stop();                        /* while its GL context is still there */
+    xr_on = false;
     eng_ui_shutdown();
     if (glc) SDL_GL_DeleteContext(glc);
     if (win) SDL_DestroyWindow(win);

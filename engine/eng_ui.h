@@ -38,6 +38,7 @@ bool eng_ui_init(SDL_Window *win, const char *title);    /* after the GL context
 void eng_ui_shutdown(void);
 void eng_ui_add_page(const eng_ui_page *p);              /* after the standard three, in the order added */
 bool eng_ui_is_open(void);
+bool eng_ui_visible(void);                                /* eng_ui_draw would draw something: the menu is open, or a hint shows */
 void eng_ui_set_open(bool on);
 bool eng_ui_quit_requested(void);                        /* File > Exit */
 bool eng_ui_restart_requested(void);                     /* File > Restart: the host re-launches the program */
@@ -52,5 +53,5 @@ void eng_ui_capture_key(void (*cb)(SDL_Scancode sc, void *u), void *u);
 void eng_ui_capture_input(bool (*cb)(const SDL_Event *e, void *u), void *u);
 bool eng_ui_capturing(void);
 void eng_ui_goto(int page, int row);                     /* tests */
-void eng_ui_nav(char k);                                 /* tests: u d l r o(k) b(ack) n(ext page) p(revious page) */
+void eng_ui_nav(char k);                                 /* tests, the VR controllers: u d l r o(k) b(ack) n(ext page) p(revious page) */
 #endif
