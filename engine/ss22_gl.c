@@ -666,7 +666,56 @@ static bool sprite_eye(const sprite_item *it, const eng_inside *v, float xyz[4][
     return true;
 }
 
-void ss22_draw_inside(eng_inside *v, int vw, int vh)
+/* WHERE THE GUN CANNOT SHOOT: the game pins every shot to its own 640 x 480 picture (0x9338, the gun's reader, clamps x to 0..639
+ * and y to 0..479 after its calibration), so an enemy the eye sees outside the camera's picture cannot be hit -- yet. That part of
+ * the eye is drawn at `keep` of its brightness. The camera's picture is four planes through its centre (sx = 320 + vx + focal x / z,
+ * sy = 240 + vy - focal y / z, as ss22_inside_ray's); seen from the eye each is a line across its picture (the eye's place left
+ * out: a head's few centimetres against the world's metres), the eye's tangents u, v meeting m . (u, v, 1) >= 0 on the camera's
+ * side. What lies past any line is darkened piece by piece -- past the first, then short of the first but past the second, and so
+ * on -- so no piece overlaps another and none is darkened twice. A camera's picture all behind the eye leaves nothing short of
+ * all four: the eye is darkened whole. */
+static int clip_half(const float (*in)[2], int n, const double m[3], double side, float (*out)[2])
+{
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        const float *a = in[i], *b = in[(i + 1) % n];
+        const double fa = side * (m[0] * a[0] + m[1] * a[1] + m[2]), fb = side * (m[0] * b[0] + m[1] * b[1] + m[2]);
+        if (fa >= 0) { out[k][0] = a[0]; out[k][1] = a[1]; k++; }
+        if ((fa >= 0) != (fb >= 0)) {
+            const double t = fa / (fa - fb);
+            out[k][0] = (float)(a[0] + t * (b[0] - a[0])); out[k][1] = (float)(a[1] + t * (b[1] - a[1])); k++;
+        }
+    }
+    return k;
+}
+static void dim_outside(const eng_inside *v, float keep)
+{
+    if (keep >= 1.0f || v->focal <= 0.0f) return;
+    const double f = v->focal, L = (-320.0 - v->vx) / f, R = (320.0 - v->vx) / f, B = (v->vy - 240.0) / f, T = (240.0 + v->vy) / f;
+    const double n[4][3] = { { 1, 0, -L }, { -1, 0, R }, { 0, 1, -B }, { 0, -1, T } };   /* the camera's side of each, its space */
+    float cur[12][2] = { { (float)v->tl, (float)v->td }, { (float)v->tr, (float)v->td }, { (float)v->tr, (float)v->tu }, { (float)v->tl, (float)v->tu } }, piece[12][2], next[12][2];
+    int nc = 4;
+    if (!p_blend_sep) p_blend_sep = (pfn_blend_sep)SDL_GL_GetProcAddress("glBlendFuncSeparate");
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(v->tl, v->tr, v->td, v->tu, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glDisable(GL_TEXTURE_2D); glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    if (p_blend_sep) p_blend_sep(GL_ZERO, GL_SRC_ALPHA, GL_ZERO, GL_ONE);   /* colour x keep, the alpha kept */
+    else glBlendFunc(GL_ZERO, GL_SRC_ALPHA);
+    glColor4f(0, 0, 0, keep);
+    for (int i = 0; i < 4 && nc >= 3; i++) {
+        double m[3];
+        for (int j = 0; j < 3; j++) m[j] = v->r[j][0] * n[i][0] + v->r[j][1] * n[i][1] + v->r[j][2] * n[i][2];
+        const int np = clip_half((const float (*)[2])cur, nc, m, -1.0, piece);
+        if (np >= 3) { glBegin(GL_POLYGON); for (int k = 0; k < np; k++) glVertex2f(piece[k][0], piece[k][1]); glEnd(); }
+        nc = clip_half((const float (*)[2])cur, nc, m, 1.0, next);
+        memcpy(cur, next, sizeof cur);
+    }
+    glDisable(GL_BLEND);
+    glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+}
+
+void ss22_draw_inside(eng_inside *v, int vw, int vh, float outside)
 {
     v->focal = 0.0f; v->vx = v->vy = 0;
     if (!pass_ready()) return;
@@ -699,6 +748,7 @@ void ss22_draw_inside(eng_inside *v, int vw, int vh)
     }
     eng_draw_end();
     screen_fade(false);
+    dim_outside(v, outside);
     if (g_fog_valid && g_fog.have_gamma) eng_post_lut(g_fog.gamma, vw, vh);
     eye_swap();
 }

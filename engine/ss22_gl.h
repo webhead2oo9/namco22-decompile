@@ -57,8 +57,9 @@ int  ss22_sprites(void);                     /* sprites in the prepared frame */
  * eyes anywhere round the camera (engine/slave_list.h eng_inside) can walk it again. The prepared quads stay the camera's own. */
 void ss22_set_inside(bool on);
 /* One Inside eye, vw x vh pixels: the world (the full-frame viewports) walked from where it is, the world's sprites (deeper than the
- * HUD's) with it, the screen fade over all of it, the gamma. *v's out fields come back filled (focal 0 = no world this frame). */
-void ss22_draw_inside(eng_inside *v, int vw, int vh);
+ * HUD's) with it, the screen fade over all of it, what the game's camera does not see (where the gun cannot shoot) at `outside` of
+ * its brightness (1 = as bright), the gamma. *v's out fields come back filled (focal 0 = no world this frame). */
+void ss22_draw_inside(eng_inside *v, int vw, int vh, float outside);
 /* The Inside view's SCREEN: what is not the world -- the HUD's sprites, the text layer, sub-window viewports, every sprite of a frame
  * with no world -- from the game's own camera, over a clear picture: its colour premultiplied by its alpha. */
 void ss22_draw_panel(int vw, int vh);

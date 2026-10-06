@@ -87,9 +87,20 @@ static void pc_ring_report(void)
 /* ---- the cabinet, scripted (headless): what the MCU's ports and A-D channels read ----------------------
  *   --autoplay            the pattern tools/mame/cov_trace_play.lua feeds MAME (the game's script)
  *   --press NAME@F[+LEN]  hold one of the game's buttons (its ss22_press_name table) from frame F for LEN frames (default 6)
- *   --pedal F             the first pedal down from frame F                                                     */
+ *   --pedal F             the first pedal down from frame F
+ *   --aim X,Y@F[+LEN]     a light-gun game: the gun's ports (engine/ss22_board.h: X 68..694, Y 43..284 over the picture; 0,0 = off it)
+ *                         from frame F for LEN frames (default 6), and there after them -- any value, the picture's range or not, goes to the
+ *                         game as it is */
 typedef struct { uint16_t bit; long from, len; } press_t;
 static press_t presses[32]; static int npress;
+typedef struct { unsigned x, y; long from, len; } aim_t;
+static aim_t aims[16]; static int naim;
+static void add_aim(const char *spec)
+{
+    aim_t a = { 0, 0, 0, 6 };
+    if (naim >= 16 || sscanf(spec, "%u,%u@%ld+%ld", &a.x, &a.y, &a.from, &a.len) < 3 || a.x > 0xFFFF || a.y > 0xFFFF) { fprintf(stderr, "[%s] bad --aim %s\n", g_ss22_game->tag, spec); return; }
+    aims[naim++] = a;
+}
 static int autoplay; static long pedal_from = -1, input_offset, clock_addr;      /* --clock ADDR: run the script on the game's own frame counter (work RAM) instead of video frames */      /* --input-offset N: the script runs N frames late (our boot lags MAME's) */
 static void add_press(const char *spec)
 {
@@ -175,11 +186,13 @@ static void update_inputs(void)
         if (start_on) { ss22_snd_inputs(p, wheel, pedal1, pedal2); return; }
         start_name = NULL;                               /* over: the player has the cabinet */
     }
-    if (ss22_host_active() && !autoplay && !npress && pedal_from < 0) return;      /* the window's keys drive the cabinet (ss22_host_frame) */
+    if (ss22_host_active() && !autoplay && !npress && !naim && pedal_from < 0) return;      /* the window's keys drive the cabinet (ss22_host_frame) */
     long n = (long)rr_frame - input_offset;
     if (clock_addr) n = (long)rr_read((uint32_t)clock_addr, 4);
     uint16_t p = 0; unsigned wheel = 0x200, pedal1 = 0, pedal2 = 0;
     for (int i = 0; i < npress; i++) if (n >= presses[i].from && n < presses[i].from + presses[i].len) p |= presses[i].bit;
+    for (int i = 0; i < naim; i++)
+        if (n >= aims[i].from && n < aims[i].from + aims[i].len) { g_ss22_gun_x = (uint16_t)aims[i].x; g_ss22_gun_y = (uint16_t)aims[i].y; g_ss22_gun_off = !aims[i].x && !aims[i].y; }
     if (pedal_from >= 0 && n >= pedal_from) pedal1 = g_ss22_game->pedal_full[0];
     if (autoplay) g_ss22_game->autoplay(n, &p, &wheel, &pedal1, &pedal2);
     ss22_snd_inputs(p, wheel, pedal1, pedal2);
@@ -477,6 +490,7 @@ int ss22_main(int argc, char **argv, const ss22_game *g)
         }
         else if (!strcmp(argv[i], "--sndsweep") && i + 1 < argc) sweep_arg(argv[++i]);
         else if (!strcmp(argv[i], "--press") && i + 1 < argc) add_press(argv[++i]);
+        else if (!strcmp(argv[i], "--aim") && i + 1 < argc) add_aim(argv[++i]);
         else if (!strcmp(argv[i], "--pedal") && i + 1 < argc) pedal_from = atol(argv[++i]);
         else if (!strcmp(argv[i], "--clock") && i + 1 < argc) clock_addr = strtol(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--input-offset") && i + 1 < argc) input_offset = atol(argv[++i]);

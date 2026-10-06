@@ -9,6 +9,7 @@
  * drawn by the game's renderer from that eye (eng_xr_stereo: engine/slave_list.h eng_eye). The runtime composites them at the
  * headset's own rate, so looking around is smooth whatever the game's 60 Hz. The VR settings (any menu shows them: eng_xr_rows):
  *   View             (a game that draws one) the screen, or INSIDE the game's world -- below
+ *   Outside the game's view  (the same games) how bright the world is where the game's camera does not look, 40 % by default
  *   Screen distance  D (m); the world's depth D * units_per_m shows ON the screen, nearer things stand out in front of it
  *   Screen size      100 % = the 4:3 picture spans the game's own field of view (life size), wider with widescreen
  *   3D depth         the eyes' distance: 100 % = 64 mm at the game's scale, 0 = a flat screen
@@ -19,7 +20,10 @@
  * moves the eye (3D depth scales them with the eyes' distance: the world's scale). What is not the world -- the HUD's sprites, the
  * text layer, sub-window viewports -- stays on the screen, which is clear wherever the game drew nothing there: a quad layer over
  * the world, at the screen's distance and size. The light gun aims at the world: the host finds what the ray meets and where the
- * game's own camera sees it (eng_xr_host.inside_aim). The window shows the left eye with the screen over it.
+ * game's own camera sees it (eng_xr_host.inside_aim). The game itself pins every shot to its camera's picture, so what lies outside
+ * that picture cannot be shot: it is drawn dimmer (Outside the game's view). The headset gets a picture every one of its frames, the
+ * game's frame again from where the head is now between the game's own (the host's pacing; eng_xr_next_frame). The window shows
+ * the left eye with the screen over it.
  * THE CONTROLLERS. A light-gun game: the aim ray hits the screen's plane, inside the 4:3 picture is where the gun points, anywhere else
  * is off-screen (a reload shot); trigger = the trigger, grip = the pedal, A / X = coin, B / Y = recenter. Any other game: the two
  * controllers are one game pad (eng_xr_get_pad): the sticks, the triggers, the grips as the shoulders, A B (right) X Y (left), a left
@@ -110,6 +114,7 @@ char eng_xr_menu_key(void);
 /* THE VR SETTINGS, for any menu: rows of a label and either a value (Left / Right change it, dir -1 / +1) or an action (dir 0); then
  * the notes, a few short lines */
 int  eng_xr_rows(void);
+float eng_xr_outside(void);                /* Inside: the brightness of what the game's camera does not see, 0..1 (1 = as bright) */
 bool eng_xr_row_value(int r);
 void eng_xr_row_text(int r, char *label, size_t ln, char *value, size_t vn);
 void eng_xr_row_change(int r, int dir);

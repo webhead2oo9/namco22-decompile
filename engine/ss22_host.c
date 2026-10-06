@@ -40,11 +40,11 @@ static bool paused, shot_pending, headless_open, restart_req;
 static eng_vsync vs;                               /* the frame pacer (engine/eng_vsync.h) */
 static bool xr_on;                                 /* --vr: an OpenXR session shares the window's GL context (engine/eng_xr.h) */
 static bool stereo_shots;                          /* ENG_STEREO_SHOTS: headless --shots also write each eye */
-static struct { bool on; double yaw, pitch, fov, p[3]; } ins_shot;   /* ENG_INSIDE_SHOTS: headless --shots also write an Inside eye */
+static struct { bool on; double yaw, pitch, fov, p[3]; float outside; } ins_shot;   /* ENG_INSIDE_SHOTS: headless --shots also write an Inside eye */
 /* the headset's side of the menu and the settings (engine/eng_xr.h eng_xr_host) */
 static bool xr_wide(void) { return g_eng_disp.wide != 0; }
 static void xr_cfg_set(const char *key, int v) { eng_cfg_set_int(key, v); }
-static const eng_ui_page xr_page = { "VR", 520, 150, 0, eng_xr_rows, eng_xr_row_value, NULL, eng_xr_row_text, eng_xr_row_change, eng_xr_notes };
+static const eng_ui_page xr_page = { "VR", 520, 170, 0, eng_xr_rows, eng_xr_row_value, NULL, eng_xr_row_text, eng_xr_row_change, eng_xr_notes };
 /* INSIDE, the light gun: what the controller's ray meets (engine/ss22_gl.h ss22_inside_ray), and where the game's camera sees it */
 static bool   ins_hit_ok;
 static double ins_hit[3];                          /* the camera's space: where the crosshair goes in each eye */
@@ -143,12 +143,14 @@ bool ss22_host_open_headless(void)
     /* ENG_INSIDE_SHOTS=<yaw>:<pitch>[:<hfov>[:<x>:<y>:<z>]] (tests): an Inside eye (engine/eng_xr.h) turned yaw degrees right and pitch
      * up, its frustum hfov wide (100 by default) by the picture's shape, at x, y, z in the camera's space (the game's units): every
      * --shots picture gets <name>_I.ppm (the eye) and <name>_S.ppm (the screen over black) beside it, and a line saying what the
-     * eye's centre ray meets and where the game's own camera sees that (the light gun's) */
+     * eye's centre ray meets and where the game's own camera sees that (the light gun's). ENG_INSIDE_OUTSIDE=<pct>: the eye's world
+     * outside the game camera's picture at that brightness (VR's Outside the game's view; 100 by default) */
     if ((e = getenv("ENG_INSIDE_SHOTS"))) {
         ins_shot.fov = 100;
         if (sscanf(e, "%lf:%lf:%lf:%lf:%lf:%lf", &ins_shot.yaw, &ins_shot.pitch, &ins_shot.fov, &ins_shot.p[0], &ins_shot.p[1], &ins_shot.p[2]) >= 2) {
             ins_shot.on = true; ss22_set_inside(true);
         }
+        ins_shot.outside = (e = getenv("ENG_INSIDE_OUTSIDE")) ? atoi(e) / 100.0f : 1.0f;
     }
     return headless_open;
 }
@@ -189,7 +191,7 @@ void ss22_host_shot(const char *path)
             eng_inside v, ray;
             shot_eye(&v, tan(ins_shot.fov * M_PI / 360.0), (double)vw / vh);
             snprintf(p, sizeof p, "%.*s_I.ppm", (int)(n > 4 ? n - 4 : n), path);
-            ss22_draw_inside(&v, vw, vh);
+            ss22_draw_inside(&v, vw, vh, ins_shot.outside);
             eng_gl_write_ppm(p, vw, vh);
             snprintf(p, sizeof p, "%.*s_S.ppm", (int)(n > 4 ? n - 4 : n), path);
             ss22_draw_panel(vw, vh);
@@ -267,7 +269,7 @@ static void xr_eye(int eye, int w, int h, void *u)
     if (eye >= ENG_XR_INSIDE) {
         eng_inside v;
         eng_xr_inside_eye(eye - ENG_XR_INSIDE, &v);
-        ss22_draw_inside(&v, w, h);
+        ss22_draw_inside(&v, w, h, eng_xr_outside());
         double e[3];
         for (int j = 0; j < 3; j++) e[j] = v.r[j][0] * (ins_hit[0] - v.p[0]) + v.r[j][1] * (ins_hit[1] - v.p[1]) + v.r[j][2] * (ins_hit[2] - v.p[2]);
         if (f->icross && ins_hit_ok && e[2] > 1.0) {
@@ -413,18 +415,18 @@ static bool pump(void)
 
 /* INSIDE AT THE HEADSET'S RATE: the game makes 59.906 pictures a second and the headset shows 72 or 90. One picture per game frame
  * leaves the runtime to show some twice, from where the head WAS -- a stutter every few frames. Inside's eyes walk the frame's copy
- * again wherever the head is now, so between game frames the headset gets this one again whenever the next game frame could not be
- * ready for the headset's next frame: due later than it, or its emulation (game_ns: the game's own part of a frame, the time the
- * host is away, its worst recent value decaying) would end after it. The game keeps its timer; only the headset sees more. */
+ * again wherever the head is now, so while the next game frame is not due yet, the headset gets this one again if that game frame
+ * could not be ready for the headset's next frame (its emulation -- game_ns: the game's own part of a frame, the time the host is
+ * away, its worst recent value decaying -- would end after it). A game frame that is due runs first, always: the game keeps its
+ * timer, and a runtime slower than its own period (a simulator) cannot starve it; only the headset sees more. */
 static uint64_t game_ns = 4000000ull, host_left;
 static void pace(void)
 {
     if (g_eng_disp_headset && eng_xr_inside() && !eng_ui_is_open())
         for (int n = 0; n < 4; n++) {                /* (4: a bound, should the runtime's clock say nonsense) */
             int64_t slot;
-            if (!eng_xr_next_frame(&slot)) break;
             const uint64_t now = eng_vsync_ns(), due = vs.next_ns + ENG_FRAME_NS;   /* the next game frame: eng_vsync_after_frame's wait */
-            if ((int64_t)((due > now ? due - now : 0) + game_ns) <= slot) break;
+            if (due <= now || !eng_xr_next_frame(&slot) || (int64_t)(due - now + game_ns) <= slot) break;
             present();
         }
     eng_vsync_after_frame(&vs, win);

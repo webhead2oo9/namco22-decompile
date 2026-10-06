@@ -125,6 +125,7 @@ static bool recenter_pending = true;
  * view, a projection layer at the eyes' poses; the game's screen (its HUD and everything else that is not the world) is chain[0],
  * a quad layer where the screen is, seen through wherever the game drew nothing */
 static int vr_view;                          /* 0 = the screen, 1 = inside (when the host draws one: host.inside) */
+static int vr_outside = 40;                  /* Inside: what the game's camera does not see, % of its brightness (where the gun cannot shoot) */
 static eye_chain ich[2];
 static GLuint ins_tex[2], ins_fbo[2];
 static int ins_w, ins_h;                     /* those pictures' size (0 = not made) */
@@ -667,6 +668,7 @@ bool eng_xr_start(const eng_xr_host *h)
     vr_size    = cfg_get("vr_size", 100);        if (vr_size < 40 || vr_size > 250) vr_size = 100;
     vr_depth   = cfg_get("vr_depth", 100);       if (vr_depth < 0 || vr_depth > 300) vr_depth = 100;
     vr_view    = cfg_get("vr_view", 0) == 1;
+    vr_outside = cfg_get("vr_outside", 40);     if (vr_outside < 0 || vr_outside > 100) vr_outside = 40;
     if (!gl_load()) { fprintf(stderr, "[VR] this OpenGL has no framebuffer objects\n"); return false; }
     if (!load_loader()) return false;
     PFN_xrEnumerateInstanceExtensionProperties enum_ext = NULL; PFN_xrCreateInstance create = NULL;
@@ -1304,31 +1306,39 @@ void eng_xr_read_done(void) { bind_fb(GL_FRAMEBUFFER, 0); }
 
 /* ---- the VR settings, for any menu ------------------------------------------------------------------------------------------- */
 /* View (a host that draws an Inside view only): the screen, or inside the game's world; Inside, the screen carries what is not the
- * world (the HUD), and 3D depth is the world's scale -- the eyes' distance and the head's moves alike */
-enum { V_VIEW, V_DIST, V_SIZE, V_DEPTH, V_CENTER, V_N };
-static int row_id(int r) { return host.inside ? r : r + 1; }
-int  eng_xr_rows(void) { return host.inside ? V_N : V_N - 1; }
+ * world (the HUD), and 3D depth is the world's scale -- the eyes' distance and the head's moves alike. Outside the game's view (the
+ * same hosts): how bright the world is where the game's camera does not look -- the gun cannot shoot there (ss22_gl.c dim_outside) */
+enum { V_VIEW, V_OUTSIDE, V_DIST, V_SIZE, V_DEPTH, V_CENTER, V_N };
+static int row_id(int r) { return host.inside ? r : r + 2; }
+int  eng_xr_rows(void) { return host.inside ? V_N : V_N - 2; }
 bool eng_xr_row_value(int r) { return row_id(r) != V_CENTER; }
+float eng_xr_outside(void) { return vr_outside / 100.0f; }
 void eng_xr_row_text(int r, char *l, size_t ln, char *v, size_t vn)
 {
     *v = 0;
     switch (row_id(r)) {
-    case V_VIEW:   snprintf(l, ln, "View"); snprintf(v, vn, "%s", vr_view ? "Inside the game's world" : "A screen in front of you"); break;
-    case V_DIST:   snprintf(l, ln, "%s distance", inside_on() ? "Screen (HUD)" : "Screen"); snprintf(v, vn, "%.2f m", vr_dist_cm / 100.0); break;
-    case V_SIZE:   snprintf(l, ln, "%s size", inside_on() ? "Screen (HUD)" : "Screen"); snprintf(v, vn, "%d %%  (%.2f m wide)", vr_size, scr_h() * (eye_h ? (double)eye_w / eye_h : 4.0 / 3.0)); break;
-    case V_DEPTH:  snprintf(l, ln, "3D depth"); if (vr_depth) snprintf(v, vn, "%d %%", vr_depth); else snprintf(v, vn, "OFF (flat)"); break;
-    case V_CENTER: snprintf(l, ln, "Screen"); snprintf(v, vn, "Recenter in front of you"); break;
+    case V_VIEW:    snprintf(l, ln, "View"); snprintf(v, vn, "%s", vr_view ? "Inside the game's world" : "A screen in front of you"); break;
+    case V_OUTSIDE: snprintf(l, ln, "Outside the game's view");
+                    if (vr_outside >= 100) snprintf(v, vn, "as bright"); else if (vr_outside <= 0) snprintf(v, vn, "dark"); else snprintf(v, vn, "%d %% bright", vr_outside);
+                    break;
+    case V_DIST:    snprintf(l, ln, "%s distance", inside_on() ? "Screen (HUD)" : "Screen"); snprintf(v, vn, "%.2f m", vr_dist_cm / 100.0); break;
+    case V_SIZE:    snprintf(l, ln, "%s size", inside_on() ? "Screen (HUD)" : "Screen"); snprintf(v, vn, "%d %%  (%.2f m wide)", vr_size, scr_h() * (eye_h ? (double)eye_w / eye_h : 4.0 / 3.0)); break;
+    case V_DEPTH:   snprintf(l, ln, "3D depth"); if (vr_depth) snprintf(v, vn, "%d %%", vr_depth); else snprintf(v, vn, "OFF (flat)"); break;
+    case V_CENTER:  snprintf(l, ln, "Screen"); snprintf(v, vn, "Recenter in front of you"); break;
     }
 }
 void eng_xr_row_change(int r, int dir)
 {
     const int d = dir ? dir : 1;
     switch (row_id(r)) {
-    case V_VIEW:   vr_view = !vr_view; cfg_set("vr_view", vr_view); fprintf(stderr, "[VR] view: %s\n", vr_view ? "inside the world" : "the screen"); break;
-    case V_DIST:   vr_dist_cm += 25 * d; if (vr_dist_cm < 50) vr_dist_cm = 50; if (vr_dist_cm > 500) vr_dist_cm = 500; cfg_set("vr_distance_cm", vr_dist_cm); break;
-    case V_SIZE:   vr_size += 10 * d; if (vr_size < 40) vr_size = 40; if (vr_size > 250) vr_size = 250; cfg_set("vr_size", vr_size); break;
-    case V_DEPTH:  vr_depth += 10 * d; if (vr_depth < 0) vr_depth = 0; if (vr_depth > 300) vr_depth = 300; cfg_set("vr_depth", vr_depth); break;
-    case V_CENTER: if (dir == 0) recenter_pending = true; break;
+    case V_VIEW:    vr_view = !vr_view; cfg_set("vr_view", vr_view); fprintf(stderr, "[VR] view: %s\n", vr_view ? "inside the world" : "the screen"); break;
+    case V_OUTSIDE: vr_outside += 20 * d; if (dir == 0 && vr_outside > 100) vr_outside = 0;   /* (OK alone steps round) */
+                    if (vr_outside < 0) vr_outside = 0; if (vr_outside > 100) vr_outside = 100; cfg_set("vr_outside", vr_outside);
+                    fprintf(stderr, "[VR] outside the game's view: %d %% bright\n", vr_outside); break;
+    case V_DIST:    vr_dist_cm += 25 * d; if (vr_dist_cm < 50) vr_dist_cm = 50; if (vr_dist_cm > 500) vr_dist_cm = 500; cfg_set("vr_distance_cm", vr_dist_cm); break;
+    case V_SIZE:    vr_size += 10 * d; if (vr_size < 40) vr_size = 40; if (vr_size > 250) vr_size = 250; cfg_set("vr_size", vr_size); break;
+    case V_DEPTH:   vr_depth += 10 * d; if (vr_depth < 0) vr_depth = 0; if (vr_depth > 300) vr_depth = 300; cfg_set("vr_depth", vr_depth); break;
+    case V_CENTER:  if (dir == 0) recenter_pending = true; break;
     }
 }
 void eng_xr_notes(void (*line)(const char *fmt, ...))
