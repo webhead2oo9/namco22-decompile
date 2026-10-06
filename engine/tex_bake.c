@@ -397,7 +397,11 @@ static void atlas_page_init(int i)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ATLAS_DIM, ATLAS_DIM, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    apages[i].shadow = malloc((size_t)ATLAS_DIM * ATLAS_DIM * 4);
+    /* one row more than the page: a slot rect's upload (tex_bake_commit, GL_UNPACK_ROW_LENGTH = the page) may be read a whole row
+     * at a time. Mesa's zink on the Steam Frame copies h rows of the full row length, the last one past the rect's own pixels, and a
+     * rect on the page's bottom rows walked off the end of the allocation into an unmapped page (Prop Cycle's attract, one run in
+     * eight). A read that starts in the page ends before ((y + h) * DIM + x) * 4 <= (DIM * DIM + DIM) * 4: this row covers it. */
+    apages[i].shadow = malloc((size_t)ATLAS_DIM * (ATLAS_DIM + 1) * 4);
     if (!apages[i].shadow) fprintf(stderr, "[TEX] atlas shadow: out of memory\n");
     apages[i].ndr = 0; apages[i].dirty_x0 = apages[i].dirty_y0 = ATLAS_DIM; apages[i].dirty_x1 = apages[i].dirty_y1 = 0;
     apages[i].cx = apages[i].cy = apages[i].row_h = 0;

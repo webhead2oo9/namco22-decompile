@@ -10,6 +10,9 @@ endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS ON)
 add_compile_options(-fno-strict-aliasing -fwrapv)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64|arm)")   # ARM (the Steam Frame): x86's arithmetic (../CMakeLists.txt)
+  add_compile_options(-fsigned-char -ffp-contract=off)
+endif()
 
 # PORTABLE (default ON): pin glibc symbol versions so a binary built here runs on older systems -- the Steam Deck included.
 # (Prop Cycle's ../include/glibc_compat.h: one copy for every game.)

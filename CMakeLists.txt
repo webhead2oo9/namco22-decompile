@@ -40,6 +40,12 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 add_compile_options(-fno-strict-aliasing -fwrapv)
+# ARM (the Steam Frame, a Raspberry Pi, ...): the arithmetic of the x86 build, which is the one checked against the arcade. Plain char
+# is signed as on x86 (ARM's is unsigned), and no fused multiply-add: ARM gcc turns a*b+c into one instruction that rounds once
+# instead of twice, and the game's floats would drift from the x86 build's (and from a PC's across a link).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64|arm)")
+  add_compile_options(-fsigned-char -ffp-contract=off)
+endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     message(WARNING "Debug build: -O0. The engine runs ~1.8x slower; "
                     "use RelWithDebInfo unless you are stepping in gdb.")

@@ -11,6 +11,7 @@
 #include "ss22_gl.h"
 #include "eng_display.h"
 #include "eng_xr.h"
+#include "eng_pad.h"
 
 #define PAD_DEADZONE   4000     /* of 32767: an Xbox pad rests near 3000. 8000 left a quarter of the stick dead, and with the curve below the steering
                                 * all came in the stick's outer half -- easing off a turn dropped it back towards the centre */
@@ -271,6 +272,7 @@ static void raw_scan(void)
         if (slot < 0) break;
         SDL_Joystick *js = SDL_JoystickOpen(j);
         if (!js) continue;
+        if (eng_pad_is_sensor(js)) { fprintf(stderr, "[INPUT] not a game device (a sensor of this machine): %s\n", SDL_JoystickName(js)); SDL_JoystickClose(js); continue; }
         raws[slot].js = js; raws[slot].id = id;
         const SDL_JoystickGUID guid = SDL_JoystickGetGUID(js);
         SDL_JoystickGetGUIDString(guid, raws[slot].guid, (int)sizeof raws[slot].guid);

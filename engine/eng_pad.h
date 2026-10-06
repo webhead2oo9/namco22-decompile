@@ -39,4 +39,14 @@ static inline bool eng_pad_present(void)
     for (int j = 0, n = SDL_NumJoysticks(); j < n; j++) if (SDL_IsGameController(j)) return true;
     return false;
 }
+
+/* A SENSOR OF THE MACHINE ITSELF that Linux lists as a joystick: not a game device, so never one of the game's. The Steam Frame's
+ * als31300 (a Hall-effect sensor in the headset) is one -- on the I2C bus, four axes resting off their centre, no buttons -- and
+ * taken for a wheel it held Prop Cycle's handlebar off centre. A game device comes over USB or Bluetooth, or has buttons. Ask on an
+ * opened joystick (the buttons need it) and close it again on a yes. */
+static inline bool eng_pad_is_sensor(SDL_Joystick *js)
+{
+    const SDL_JoystickGUID g = SDL_JoystickGetGUID(js);                         /* SDL's first word: the bus (linux/input.h BUS_*) */
+    return (g.data[0] | g.data[1] << 8) == 0x18 && SDL_JoystickNumButtons(js) == 0;   /* BUS_I2C */
+}
 #endif

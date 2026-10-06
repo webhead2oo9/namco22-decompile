@@ -79,6 +79,7 @@
 #include "ui_menu.h"
 #include "pedal_enc.h"        /* an exercise bike's encoder / a Peloton as the pedal */
 #include "eng_xr.h"           /* a VR headset's controllers as a pad (--vr) */
+#include "eng_pad.h"          /* a sensor of the machine is no joystick of ours */
 
 /* MCU shared RAM, relative to commsram base 0xA04000 */
 #define MCU_CMD      (0xBD00 - 0x4000)   /* command from CPU        */
@@ -142,6 +143,10 @@ static void pad_open_all(void) {
                 printf("  [PAD] %d: %s\n", slot, SDL_GameControllerName(pads[slot]));
             }
         } else if ((raws[slot] = SDL_JoystickOpen(i))) {
+            if (eng_pad_is_sensor(raws[slot])) {
+                printf("  [JOY] not a game device (a sensor of this machine): %s\n", SDL_JoystickName(raws[slot]));
+                SDL_JoystickClose(raws[slot]); raws[slot] = NULL; continue;
+            }
             raw_id[slot] = id;
             printf("  [JOY] %d: %s (%d axes, %d buttons) -- mapped by number, see --joytest\n", slot,
                    SDL_JoystickName(raws[slot]), SDL_JoystickNumAxes(raws[slot]), SDL_JoystickNumButtons(raws[slot]));

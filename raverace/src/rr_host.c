@@ -65,6 +65,10 @@ static void dev_scan(void)
             if ((dev[free_slot].gc = SDL_GameControllerOpen(i)))
                 fprintf(stderr, "[HOST] gamepad %d: %s\n", free_slot, SDL_GameControllerName(dev[free_slot].gc));
         } else if ((dev[free_slot].js = SDL_JoystickOpen(i))) {
+            if (eng_pad_is_sensor(dev[free_slot].js)) {
+                fprintf(stderr, "[HOST] not a game device (a sensor of this machine): %s\n", SDL_JoystickName(dev[free_slot].js));
+                SDL_JoystickClose(dev[free_slot].js); dev[free_slot].js = NULL; continue;
+            }
             fprintf(stderr, "[HOST] joystick %d: %s (%d axes, %d buttons) -- mapped by number, see rr --joytest\n", free_slot,
                     SDL_JoystickName(dev[free_slot].js), SDL_JoystickNumAxes(dev[free_slot].js), SDL_JoystickNumButtons(dev[free_slot].js));
         }

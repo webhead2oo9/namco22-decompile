@@ -123,6 +123,7 @@ static bool recenter_pending = true;
 /* the controllers */
 static XrActionSet aset;
 static XrAction a_aim, a_trigger, a_squeeze, a_coin, a_recenter, a_haptic, a_menu, a_nav, a_stick;
+static XrAction a_x, a_y, a_dpad[4];         /* the Steam Frame's own: X and Y on its right hand, the d-pad (up, down, left, right) on its left */
 static XrPath hand[2];
 static XrSpace aim_space[2];
 static int gun_hand = 1;                     /* the hand that pulled its trigger last (the right one to begin with) */
@@ -199,6 +200,10 @@ static bool load_loader(void)
 #else
     lib = dlopen("libopenxr_loader.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!lib) lib = dlopen("libopenxr_loader.so", RTLD_NOW | RTLD_LOCAL);
+#ifdef __aarch64__
+    /* the Steam Frame: SteamOS has no openxr package, and SteamVR -- the Frame's runtime -- keeps Khronos' loader beside itself */
+    if (!lib) lib = dlopen("/opt/steamvr/bin/linuxarm64/libopenxr_loader.so", RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!lib) { fprintf(stderr, "[VR] no OpenXR loader (libopenxr_loader.so.1): install your distribution's openxr package\n"); return false; }
     xrGetInstanceProcAddr = (PFN_xrGetInstanceProcAddr)dlsym(lib, "xrGetInstanceProcAddr");
 #endif
@@ -326,6 +331,19 @@ static bool make_action(XrAction *a, const char *name, const char *loc, XrAction
     ci.actionType = type; ci.countSubactionPaths = 2; ci.subactionPaths = hand;
     return XR_OK(xrCreateAction(aset, &ci, a), name);
 }
+static void suggest(const char *profile, const XrActionSuggestedBinding *sb, int k)
+{
+    XrInteractionProfileSuggestedBinding s = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+    s.interactionProfile = path(profile); s.suggestedBindings = sb; s.countSuggestedBindings = (uint32_t)k;
+    const XrResult r = xrSuggestInteractionProfileBindings(inst, &s);
+    if (XR_FAILED(r)) fprintf(stderr, "[VR] bindings for %s: %s\n", profile, res_str(r));
+}
+/* THE STEAM FRAME's controllers are the two halves of a gamepad -- the right one A, B, X, Y and Menu, the left one a d-pad and View,
+ * each a stick, trigger, grip and bumper -- and here each button is that gamepad's own: X and Y are the right hand's (on Touch they
+ * are the left's), the d-pad is the pad's d-pad and steps the menu. Their profile needs Valve's extension, which Khronos' headers do
+ * not name yet (partner.steamgames.com/doc/steamhardware/steamframe/input); without it SteamVR plays the Touch bindings on them. */
+#define EXT_FRAME_PAD "XR_VALVE_frame_controller_interaction"
+static bool ext_frame_pad;                                   /* the runtime offered it, and the instance has it on */
 static bool make_actions(void)
 {
     hand[0] = path("/user/hand/left"); hand[1] = path("/user/hand/right");
@@ -341,7 +359,13 @@ static bool make_actions(void)
         !make_action(&a_haptic, "recoil", "Recoil", XR_ACTION_TYPE_VIBRATION_OUTPUT) ||
         !make_action(&a_menu, "menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
         !make_action(&a_nav, "stick", "Stick", XR_ACTION_TYPE_VECTOR2F_INPUT) ||
-        !make_action(&a_stick, "stick_click", "Stick click (coin / start)", XR_ACTION_TYPE_BOOLEAN_INPUT)) return false;
+        !make_action(&a_stick, "stick_click", "Stick click (coin / start)", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+        !make_action(&a_x, "x", "X", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+        !make_action(&a_y, "y", "Y", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+        !make_action(&a_dpad[0], "dpad_up", "D-pad up", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+        !make_action(&a_dpad[1], "dpad_down", "D-pad down", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+        !make_action(&a_dpad[2], "dpad_left", "D-pad left", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+        !make_action(&a_dpad[3], "dpad_right", "D-pad right", XR_ACTION_TYPE_BOOLEAN_INPUT)) return false;
     /* each profile's components under /user/hand/<side>/ ("<" / ">" = the left / right hand's only: a component a profile lacks on
      * one side fails that profile's whole suggestion, and the menu button takes one side's stick click where there is no menu button
      * to spare); a runtime that does not know a profile says so, and that is no failure */
@@ -374,10 +398,31 @@ static bool make_actions(void)
                 sb[k++] = (XrActionSuggestedBinding){ *acts[a], path(full) };
             }
         }
-        XrInteractionProfileSuggestedBinding s = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
-        s.interactionProfile = path(profs[p].name); s.suggestedBindings = sb; s.countSuggestedBindings = (uint32_t)k;
-        const XrResult r = xrSuggestInteractionProfileBindings(inst, &s);
-        if (XR_FAILED(r)) fprintf(stderr, "[VR] bindings for %s: %s\n", profs[p].name, res_str(r));
+        suggest(profs[p].name, sb, k);
+    }
+    if (ext_frame_pad) {
+        /* the Frame, button for button: Menu is the pad's Start (as a right stick click is), View this game's menu (SteamVR gives
+         * Touch's menu button the View button too), the bumpers the pad's shoulders with the grips (the gun's pedal in Time Crisis) */
+        const struct { XrAction *a; const char *p; } fb[] = {
+            { &a_aim, "left/input/aim/pose" },            { &a_aim, "right/input/aim/pose" },
+            { &a_trigger, "left/input/trigger/value" },   { &a_trigger, "right/input/trigger/value" },
+            { &a_squeeze, "left/input/squeeze/value" },   { &a_squeeze, "right/input/squeeze/value" },
+            { &a_squeeze, "left/input/bumper/click" },    { &a_squeeze, "right/input/bumper/click" },
+            { &a_haptic, "left/output/haptic" },          { &a_haptic, "right/output/haptic" },
+            { &a_nav, "left/input/thumbstick" },          { &a_nav, "right/input/thumbstick" },
+            { &a_stick, "left/input/thumbstick/click" },  { &a_stick, "right/input/thumbstick/click" },
+            { &a_stick, "right/input/menu/click" },       { &a_menu, "left/input/view/click" },
+            { &a_coin, "right/input/a/click" },           { &a_recenter, "right/input/b/click" },
+            { &a_x, "right/input/x/click" },              { &a_y, "right/input/y/click" },
+            { &a_dpad[0], "left/input/dpad_up/click" },   { &a_dpad[1], "left/input/dpad_down/click" },
+            { &a_dpad[2], "left/input/dpad_left/click" }, { &a_dpad[3], "left/input/dpad_right/click" },
+        };
+        XrActionSuggestedBinding sb[sizeof fb / sizeof fb[0]];
+        for (size_t i = 0; i < sizeof fb / sizeof fb[0]; i++) {
+            char full[96]; snprintf(full, sizeof full, "/user/hand/%s", fb[i].p);
+            sb[i] = (XrActionSuggestedBinding){ *fb[i].a, path(full) };
+        }
+        suggest("/interaction_profiles/valve/frame_controller_valve", sb, (int)(sizeof fb / sizeof fb[0]));
     }
     return true;
 }
@@ -535,21 +580,25 @@ bool eng_xr_start(const eng_xr_host *h)
     if (XR_FAILED(enum_ext(NULL, 0, &n, NULL)) || !n) { fprintf(stderr, "[VR] no OpenXR runtime is active (start SteamVR, Monado, ... or set one as the system's OpenXR runtime)\n"); eng_xr_stop(); return false; }
     XrExtensionProperties *ext = calloc(n, sizeof *ext);
     bool have_gl = false;
+    ext_frame_pad = false;
     if (ext) {
         for (uint32_t i = 0; i < n; i++) ext[i].type = XR_TYPE_EXTENSION_PROPERTIES;
         if (XR_SUCCEEDED(enum_ext(NULL, n, &n, ext)))
-            for (uint32_t i = 0; i < n; i++) if (!strcmp(ext[i].extensionName, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME)) have_gl = true;
+            for (uint32_t i = 0; i < n; i++) {
+                if (!strcmp(ext[i].extensionName, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME)) have_gl = true;
+                if (!strcmp(ext[i].extensionName, EXT_FRAME_PAD)) ext_frame_pad = true;
+            }
         free(ext);
     }
     if (!have_gl) { fprintf(stderr, "[VR] the OpenXR runtime has no OpenGL support (XR_KHR_opengl_enable)\n"); eng_xr_stop(); return false; }
 
-    const char *exts[] = { XR_KHR_OPENGL_ENABLE_EXTENSION_NAME };
+    const char *exts[] = { XR_KHR_OPENGL_ENABLE_EXTENSION_NAME, EXT_FRAME_PAD };   /* the Frame's controllers: when offered */
     XrInstanceCreateInfo ici = { XR_TYPE_INSTANCE_CREATE_INFO };
     snprintf(ici.applicationInfo.applicationName, sizeof ici.applicationInfo.applicationName, "%s", host.app ? host.app : "namco22");
     snprintf(ici.applicationInfo.engineName, sizeof ici.applicationInfo.engineName, "namco22");
     ici.applicationInfo.applicationVersion = 1; ici.applicationInfo.engineVersion = 1;
     ici.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    ici.enabledExtensionCount = 1; ici.enabledExtensionNames = exts;
+    ici.enabledExtensionCount = ext_frame_pad ? 2 : 1; ici.enabledExtensionNames = exts;
     if (!XR_OK(create(&ici, &inst), "xrCreateInstance")) { inst = XR_NULL_HANDLE; eng_xr_stop(); return false; }
 #define XRF(f) if (XR_FAILED(xrGetInstanceProcAddr(inst, #f, (PFN_xrVoidFunction *)&f)) || !f) { fprintf(stderr, "[VR] the runtime lacks %s\n", #f); eng_xr_stop(); return false; }
     XR_FUNCS(XRF)
@@ -604,8 +653,8 @@ bool eng_xr_start(const eng_xr_host *h)
             if (XR_SUCCEEDED(xrEnumerateSwapchainImages(bg.sc, n, &n, (XrSwapchainImageBaseHeader *)bg.img))) bg.n = n;
         } }
     if (!make_actions() || !attach_actions()) { eng_xr_stop(); return false; }
-    fprintf(stderr, "[VR] %s, %s: a %.2f m screen at %.2f m, 3D depth %d %% (%d units a metre)\n", runtime_name, system_name,
-            scr_w43() * eye_w / (eye_h * 4.0 / 3.0), vr_dist_cm / 100.0, vr_depth, upm);
+    fprintf(stderr, "[VR] %s, %s: a %.2f m screen at %.2f m, 3D depth %d %% (%d units a metre)%s\n", runtime_name, system_name,
+            scr_w43() * eye_w / (eye_h * 4.0 / 3.0), vr_dist_cm / 100.0, vr_depth, upm, ext_frame_pad ? "; the Steam Frame's controllers" : "");
     return true;
 }
 
@@ -689,7 +738,10 @@ void eng_xr_poll(void)
         menu = menu || act_bool(a_menu, h);
         stick[h] = act_vec2(a_nav, h);
     }
-    const bool ok = ax[0] || ax[1], cen = by[0] || by[1];
+    const bool fx = act_bool(a_x, 1), fy = act_bool(a_y, 1);       /* the Frame's X and Y: the pad's, on its right hand */
+    bool dpad[4];                                                    /* the Frame's d-pad: up, down, left, right */
+    for (int i = 0; i < 4; i++) dpad[i] = act_bool(a_dpad[i], 0);
+    const bool ok = ax[0] || ax[1] || fx, cen = by[0] || by[1] || fy;
     aim_update();
     if (menu_now) {
         /* THE MENU has the controllers (the host reads none of the game's controls while it is open): the pointer and its trigger
@@ -714,7 +766,8 @@ void eng_xr_poll(void)
         if (menu && !menu_prev) mkey('b');
         if (ok && !ok_prev) mkey('o');
         if (cen && !cen_prev) mkey('b');
-        const XrVector2f s = stick[0].x * stick[0].x + stick[0].y * stick[0].y > stick[1].x * stick[1].x + stick[1].y * stick[1].y ? stick[0] : stick[1];
+        XrVector2f s = stick[0].x * stick[0].x + stick[0].y * stick[0].y > stick[1].x * stick[1].x + stick[1].y * stick[1].y ? stick[0] : stick[1];
+        if (dpad[0] || dpad[1] || dpad[2] || dpad[3]) s = (XrVector2f){ (float)(dpad[3] - dpad[2]), (float)(dpad[0] - dpad[1]) };   /* steps as the stick */
         menu_stick(s.x, s.y);
         if (!ptr_ok && !ptr_down) last_x = last_y = -1;
     } else {
@@ -732,9 +785,11 @@ void eng_xr_poll(void)
             pad.axis[SDL_CONTROLLER_AXIS_RIGHTX] = axis16(stick[1].x);  pad.axis[SDL_CONTROLLER_AXIS_RIGHTY] = axis16(-stick[1].y);
             pad.axis[SDL_CONTROLLER_AXIS_TRIGGERLEFT] = axis16(trv[0]); pad.axis[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = axis16(trv[1]);
             const struct { bool on; SDL_GameControllerButton b; } m[] = {
-                { ax[1], SDL_CONTROLLER_BUTTON_A }, { by[1], SDL_CONTROLLER_BUTTON_B }, { ax[0], SDL_CONTROLLER_BUTTON_X }, { by[0], SDL_CONTROLLER_BUTTON_Y },
+                { ax[1], SDL_CONTROLLER_BUTTON_A }, { by[1], SDL_CONTROLLER_BUTTON_B }, { ax[0] || fx, SDL_CONTROLLER_BUTTON_X }, { by[0] || fy, SDL_CONTROLLER_BUTTON_Y },
                 { grip[0], SDL_CONTROLLER_BUTTON_LEFTSHOULDER }, { grip[1], SDL_CONTROLLER_BUTTON_RIGHTSHOULDER },
-                { click[0], SDL_CONTROLLER_BUTTON_BACK }, { click[1], SDL_CONTROLLER_BUTTON_START } };
+                { click[0], SDL_CONTROLLER_BUTTON_BACK }, { click[1], SDL_CONTROLLER_BUTTON_START },
+                { dpad[0], SDL_CONTROLLER_BUTTON_DPAD_UP }, { dpad[1], SDL_CONTROLLER_BUTTON_DPAD_DOWN },
+                { dpad[2], SDL_CONTROLLER_BUTTON_DPAD_LEFT }, { dpad[3], SDL_CONTROLLER_BUTTON_DPAD_RIGHT } };
             for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i].on) pad.buttons |= 1u << m[i].b;
             pad_ok = true;
         }
