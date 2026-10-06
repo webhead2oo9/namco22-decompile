@@ -91,6 +91,10 @@ typedef struct {
     int32_t light[3];      /* light vector, Q15 */
     int32_t ambient, power;
     int     objectflags;   /* System 22 only, see geo_quad */
+    /* INSIDE (engine/slave_list.h eng_inside): m[][] then takes an eye anywhere around the camera, its picture stretched onto the
+     * 640 x 480; the normals light by the camera's own combined matrix, kept here (have_lm), so the lighting is the game's */
+    int     have_lm;
+    int32_t lm[3][3];
 } geo_view;
 
 typedef struct {

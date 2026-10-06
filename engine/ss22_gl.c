@@ -51,6 +51,13 @@ static int32_t eye_dx(int eye) { return eye ? st_sep - st_sep / 2 : -(st_sep / 2
 void ss22_set_stereo(int32_t sep, int32_t zconv, float focal_max) { st_sep = sep > 0 ? sep : 0; st_zconv = zconv; st_fmax = focal_max; }
 bool ss22_stereo_frame(void) { return st_frame; }
 
+/* INSIDE (ss22_set_inside): polygon RAM as this frame's walk saw it, kept for the eyes a headset draws later -- each walks the same
+ * list from where it is (and the gun's ray once more). The prepared quads stay the game camera's own: the screen's (ss22_draw_panel). */
+static bool      ins_on, ins_frame, ins_world;  /* asked for; the prepared frame has the copy; it has a full-frame viewport (a world) */
+static uint32_t *ins_poly;
+static uint32_t ins_word(int i) { return ins_poly[i & 0x7FFF]; }
+void ss22_set_inside(bool on) { ins_on = on; }
+
 static void push_quad(const geo_quad *q, void *user)
 {
     (void)user;
@@ -110,7 +117,9 @@ void ss22_gl_set_hud(const eng_hud_cfg *h) { hud_cfg = h; }
  * photodiode can find the beam -- the mixer's screen fade at full strength in white, switched on for ONE frame with no ramp
  * (measured: fade FFFFFF x FF, flags 03, the frames either side 00). Our gun is the pointer and needs no flash; with the option
  * off, such an instant white is not drawn for up to 2 frames. A real fade to white ramps (the factor climbs over frames) and
- * is left alone; one that STARTS at full white shows from its third frame. The game itself is untouched. */
+ * is left alone; one that STARTS at full white shows from its third frame. The game itself is untouched.
+ * INSIDE never draws it, whatever the option: there the fade covers the whole world round the player, and a shot would strobe
+ * everything they can see white, every shot, at the headset's brightness. */
 static bool gun_flash = true;
 void ss22_gl_set_gun_flash(bool on) { gun_flash = on; }
 static void gun_flash_filter(void)
@@ -122,7 +131,7 @@ static void gun_flash_filter(void)
     if (!white) run = 0;
     else if (run || !prev_fade) run++;                   /* white straight out of no fade: a flash (a ramp reaching white has prev_fade set) */
     prev_fade = fade;
-    if (!gun_flash && run && run <= 2) g_fog.screen_fade_factor = 0;
+    if ((!gun_flash || ins_on) && run && run <= 2) g_fog.screen_fade_factor = 0;
 }
 
 void ss22_prepare(const ss22_regs *r)
@@ -176,6 +185,12 @@ void ss22_prepare(const ss22_regs *r)
             eye_swap();
             st_focal = eye[0].focal;
         }
+    }
+    ins_frame = ins_world = false;
+    if (ins_on && r->walk && (ins_poly || (ins_poly = malloc(0x8000 * sizeof *ins_poly)))) {
+        for (int i = 0; i < 0x8000; i++) ins_poly[i] = r->poly_word(i);
+        ins_frame = true;
+        for (int i = 0; i < qn && !ins_world; i++) ins_world = qbuf[i].clip[0] <= 0 && qbuf[i].clip[1] >= NW - 1;
     }
     ss22_qhist_report();
     ss22_cliplog_report();
@@ -252,9 +267,24 @@ static void tex_alloc(GLuint *t)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SPR_W, SPR_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 }
 
+/* INSIDE's SCREEN (ss22_draw_panel) is drawn over a clear picture and goes out as a layer: its alpha has to be what covers, so a blend
+ * there adds alpha as "over" does (the colour, blended as ever into black, comes out premultiplied) */
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+typedef void (APIENTRY *pfn_blend_sep)(GLenum, GLenum, GLenum, GLenum);
+static pfn_blend_sep p_blend_sep;
+static bool panel_pass;
+static void blend_over(void)
+{
+    if (panel_pass && p_blend_sep) p_blend_sep(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    else glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
 /* one sprite in its turn of the merged z order: rendered into the corner of one 640x480 texture, sub-imaged, blended; par = its stereo
- * parallax (scene units, 0 = flat on the screen's plane) */
-static void draw_sprite(const sprite_item *it, float par)
+ * parallax (scene units, 0 = flat on the screen's plane); xyz = an Inside eye's own corners for it (x, y, the eye's depth), clockwise
+ * from the top left, or NULL */
+static void draw_sprite(const sprite_item *it, float par, const float (*xyz)[3])
 {
     if (!spr_buf && !(spr_buf = malloc((size_t)SPR_W * SPR_H * 4))) return;
     sprite_render_item(&sst, &g_fog, it, spr_buf, 1);
@@ -270,16 +300,21 @@ static void draw_sprite(const sprite_item *it, float par)
     glEnable(GL_TEXTURE_2D);
     glDisable(GL_ALPHA_TEST);
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    blend_over();
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-    /* widescreen: a HUD sprite goes out to its side (a sprite that is deep in the world, a billboard, stays where the 3D puts it) */
-    const int dx = (g_eng_hud_e && hud_cfg && (int)(it->z & 0x1FFFFF) <= hud_cfg->sprite_zmax) ? eng_hud_dx(it->x0 + it->w / 2.0) : 0;
-    const float x0 = (float)(it->x0 + dx) + par, x1 = x0 + (float)it->w;
     glBegin(GL_QUADS);
-    glTexCoord2f(0,  0);  glVertex2f(x0, (float)it->y0);
-    glTexCoord2f(su, 0);  glVertex2f(x1, (float)it->y0);
-    glTexCoord2f(su, sv); glVertex2f(x1, (float)(it->y0 + it->h));
-    glTexCoord2f(0,  sv); glVertex2f(x0, (float)(it->y0 + it->h));
+    if (xyz) {                                /* (a billboard square on to the game's camera: a plane, so its texture is the eye's 1/z) */
+        const float s[4] = { 0, su, su, 0 }, t[4] = { 0, 0, sv, sv };
+        for (int k = 0; k < 4; k++) { const float w = 1.0f / xyz[k][2]; glTexCoord4f(s[k] * w, t[k] * w, 0, w); glVertex2f(xyz[k][0], xyz[k][1]); }
+    } else {
+        /* widescreen: a HUD sprite goes out to its side (a sprite that is deep in the world, a billboard, stays where the 3D puts it) */
+        const int dx = (g_eng_hud_e && hud_cfg && (int)(it->z & 0x1FFFFF) <= hud_cfg->sprite_zmax) ? eng_hud_dx(it->x0 + it->w / 2.0) : 0;
+        const float x0 = (float)(it->x0 + dx) + par, x1 = x0 + (float)it->w;
+        glTexCoord2f(0,  0);  glVertex2f(x0, (float)it->y0);
+        glTexCoord2f(su, 0);  glVertex2f(x1, (float)it->y0);
+        glTexCoord2f(su, sv); glVertex2f(x1, (float)(it->y0 + it->h));
+        glTexCoord2f(0,  sv); glVertex2f(x0, (float)(it->y0 + it->h));
+    }
     glEnd();
     glDisable(GL_BLEND);
     glEnable(GL_ALPHA_TEST);
@@ -459,7 +494,7 @@ static void draw_text(void)
     glEnable(GL_TEXTURE_2D);
     glDisable(GL_ALPHA_TEST);
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    blend_over();
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
     if (g_eng_hud_e) {
         if (split) {                                      /* the shade where it was (and out to the picture's edges), then the text piece by piece */
@@ -507,12 +542,59 @@ void ss22_draw_eye(int eye, int vw, int vh)
     if (right) eye_swap();
 }
 
-static void draw_frame(int vw, int vh, int eye)
+/* every pass's start: nothing to draw with yet = false */
+static bool pass_ready(void)
 {
-    if (!g_eng_pointrom) return;
+    if (!g_eng_pointrom) return false;
     if (!gl_ready) { renderer_texture_init(); gl_ready = true; }
     g_tex_opaque = 1;                       /* the polygon path has no transparent pen */
     if (prio_any) { memset(prio_mask, 0, sizeof prio_mask); prio_any = false; }
+    return true;
+}
+/* GL's state for the 2D scene: the viewport, a top-down ortho over g_scene_x0 .. x1 by 480, no depth test, no blend */
+static void pass_gl(int vw, int vh)
+{
+    glViewport(0, 0, vw, vh);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    glOrtho(g_scene_x0, g_scene_x1, NH, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_ALPHA_TEST); glAlphaFunc(GL_GREATER, 0.1f);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+}
+static void quad_cfg(eng_draw_cfg *cfg)
+{
+    memset(cfg, 0, sizeof *cfg);
+    cfg->shade = 1;
+    cfg->fog = g_fog_valid;
+    cfg->fog_before_shade = 0;               /* Super 22 */
+    cfg->fog_quad = ss22_fog_quad;
+    cfg->fade_rgb = ss22_fade_rgb;
+    cfg->wide_backdrop = 1;                   /* a menu's screen-sized backdrop reaches the wide picture's edges (engine/quad_gl.c) */
+    { static int tc = -1; if (tc < 0) { const char *e = getenv("ENG_TEXEL_CENTRE"); tc = e ? atoi(e) : 1; } cfg->texel_centre = tc; }
+}
+/* the screen fade: blend(rgb, fade, 0xff - factor) over every pixel, background included, i.e. the fade colour at alpha (factor + 1) / 256.
+ * Inside's screen (panel): over what is drawn there only, its alpha kept -- the world's eyes take the whole fade themselves. */
+static void screen_fade(bool panel)
+{
+    if (!(g_fog_valid && (g_fog.mixer_flags & 1) && g_fog.screen_fade_factor) || (panel && !p_blend_sep)) return;
+    const float a = (g_fog.screen_fade_factor + 1) / 256.0f, k = panel ? a : 1.0f;
+    glDisable(GL_TEXTURE_2D); glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    if (panel) p_blend_sep(GL_DST_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);   /* fade x a x what covers + rgb x (1 - a) */
+    else glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(g_fog.screen_fade[0] / 255.0f * k, g_fog.screen_fade[1] / 255.0f * k, g_fog.screen_fade[2] / 255.0f * k, a);
+    glBegin(GL_QUADS);
+    glVertex2f(g_scene_x0, 0); glVertex2f(g_scene_x1, 0); glVertex2f(g_scene_x1, NH); glVertex2f(g_scene_x0, NH);
+    glEnd();
+    glDisable(GL_BLEND); glEnable(GL_ALPHA_TEST);
+}
+
+static void draw_frame(int vw, int vh, int eye)
+{
+    if (!pass_ready()) return;
 
     /* the scene's width: wider than 4:3 widens full-frame viewports (Hor+) */
     const double aspect = (double)vw / vh;
@@ -525,15 +607,7 @@ static void draw_frame(int vw, int vh, int eye)
     g_eng_quad_dx = eng_hud_quad_dx;
     eng_hud_quads_scan(qbuf, qn, hud_cfg ? hud_cfg->quad_band : -1, hud_cfg && hud_cfg->quad_zero_depth);
 
-    glViewport(0, 0, vw, vh);
-    glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    glOrtho(g_scene_x0, g_scene_x1, NH, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-    glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND);
-    glDisable(GL_TEXTURE_2D);
-    glEnable(GL_ALPHA_TEST); glAlphaFunc(GL_GREATER, 0.1f);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    pass_gl(vw, vh);
 
     { static int ml = -1; if (ml < 0) ml = getenv("ENG_MIXLOG") != NULL;       /* ENG_MIXLOG=1: the mixer state of every drawn frame (finding what makes a frame white) */
       if (ml) fprintf(stderr, "[MIX] bg %02X%02X%02X fade %02X%02X%02X x%02X flags %02X quads %d sprites %d\n", g_fog.bg[0], g_fog.bg[1], g_fog.bg[2],
@@ -543,14 +617,7 @@ static void draw_frame(int vw, int vh, int eye)
     glClear(GL_COLOR_BUFFER_BIT);
 
     eng_draw_cfg cfg;
-    memset(&cfg, 0, sizeof cfg);
-    cfg.shade = 1;
-    cfg.fog = g_fog_valid;
-    cfg.fog_before_shade = 0;               /* Super 22 */
-    cfg.fog_quad = ss22_fog_quad;
-    cfg.fade_rgb = ss22_fade_rgb;
-    cfg.wide_backdrop = 1;                   /* a menu's screen-sized backdrop reaches the wide picture's edges (engine/quad_gl.c) */
-    { static int tc = -1; if (tc < 0) { const char *e = getenv("ENG_TEXEL_CENTRE"); tc = e ? atoi(e) : 1; } cfg.texel_centre = tc; }
+    quad_cfg(&cfg);
 
     /* MERGED Z ORDER, not layers: MAME queues sprites and polygons into the same radix tree keyed on a 24-bit z and
      * walks it far to near, so a sprite can sit behind a polygon (the HUD plate behind the score digits) */
@@ -559,28 +626,148 @@ static void draw_frame(int vw, int vh, int eye)
     while (qi < qn || si < ni) {
         const uint32_t qz = qi < qn ? (uint32_t)(qbuf[qi].zsort & 0xFFFFFF) : 0;
         const uint32_t sz = si < ni ? items[si].z : 0;
-        if (si < ni && (qi >= qn || sz >= qz)) { eng_draw_end(); draw_sprite(&items[si], sprite_parallax(&items[si], eye)); si++; eng_draw_resume(); }
+        if (si < ni && (qi >= qn || sz >= qz)) { eng_draw_end(); draw_sprite(&items[si], sprite_parallax(&items[si], eye), NULL); si++; eng_draw_resume(); }
         else eng_draw_quad(&qbuf[qi++], &cfg);
     }
     eng_draw_end();
 
-    /* the screen fade: blend(rgb, fade, 0xff - factor) over every pixel, background included, i.e. the fade colour at
-     * alpha (factor + 1) / 256 */
-    if (g_fog_valid && (g_fog.mixer_flags & 1) && g_fog.screen_fade_factor) {
-        const float a = (g_fog.screen_fade_factor + 1) / 256.0f;
-        glDisable(GL_TEXTURE_2D); glDisable(GL_ALPHA_TEST);
-        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glColor4f(g_fog.screen_fade[0] / 255.0f, g_fog.screen_fade[1] / 255.0f, g_fog.screen_fade[2] / 255.0f, a);
-        glBegin(GL_QUADS);
-        glVertex2f(g_scene_x0, 0); glVertex2f(g_scene_x1, 0); glVertex2f(g_scene_x1, NH); glVertex2f(g_scene_x0, NH);
-        glEnd();
-        glDisable(GL_BLEND); glEnable(GL_ALPHA_TEST);
-    }
+    screen_fade(false);
 
     draw_text();
 
     /* the mixer's gamma over the whole frame, once, as the hardware does at scanout */
     if (g_fog_valid && g_fog.have_gamma) eng_post_lut(g_fog.gamma, vw, vh);
+}
+
+/* ------------------------------------------------------------------ INSIDE (engine/eng_xr.h View: Inside) */
+/* The world is the full-frame viewports; a sprite in it is one deeper than the HUD's, in a frame that has a world (sprite_parallax's
+ * rule). Everything else -- the HUD's sprites, the text layer, sub-window viewports, a frame with no world -- is the screen's. */
+static bool full_frame(const geo_quad *q) { return q->clip[0] <= 0 && q->clip[1] >= NW - 1; }
+static bool world_sprite(const sprite_item *it)
+{
+    const int32_t z = (int32_t)(it->z & 0x1FFFFF);
+    return ins_world && z > (hud_cfg ? hud_cfg->sprite_zmax : 0);
+}
+/* a billboard as the eye sees it: its rectangle on the game's picture at its depth, back through the game's lens into the camera's
+ * space, then into the eye and its frustum over the 640 x 480 (x, y, the eye's depth); false = a corner is behind the eye */
+static bool sprite_eye(const sprite_item *it, const eng_inside *v, float xyz[4][3])
+{
+    const double K = v->focal, cx = 320.0 + v->vx, cy = 240.0 + v->vy, z = (double)(it->z & 0x1FFFFF);
+    const double sx[4] = { it->x0, it->x0 + it->w, it->x0 + it->w, it->x0 }, sy[4] = { it->y0, it->y0, it->y0 + it->h, it->y0 + it->h };
+    for (int k = 0; k < 4; k++) {
+        const double P[3] = { (sx[k] - cx) * z / K - v->p[0], (cy - sy[k]) * z / K - v->p[1], z - v->p[2] };
+        double e[3];
+        for (int j = 0; j < 3; j++) e[j] = v->r[j][0] * P[0] + v->r[j][1] * P[1] + v->r[j][2] * P[2];
+        if (e[2] < 1.0) return false;
+        xyz[k][0] = (float)(NW * (e[0] / e[2] - v->tl) / (v->tr - v->tl));
+        xyz[k][1] = (float)(NH * (v->tu - e[1] / e[2]) / (v->tu - v->td));
+        xyz[k][2] = (float)e[2];
+    }
+    return true;
+}
+
+void ss22_draw_inside(eng_inside *v, int vw, int vh)
+{
+    v->focal = 0.0f; v->vx = v->vy = 0;
+    if (!pass_ready()) return;
+    g_scene_x0 = 0.0f; g_scene_x1 = NW;      /* the eye's frustum is the whole 640 x 480 */
+    eng_hud_begin(false); g_eng_quad_dx = NULL;
+    eye_swap();                              /* its quads go where a right eye's would (an Inside frame has no stereo pair) */
+    qn = 0; qorder = 0;
+    if (ins_frame) {
+        eng_list_cfg lc = { ENG_LIST_HEAD_SS22, 0, NULL, NULL, NULL, NULL, NULL, v };
+        eng_walk_list(ins_word, &lc, push_quad, NULL);
+        eng_quad_sort(qbuf, qn, 0);
+    }
+    pass_gl(vw, vh);
+    glClearColor(g_fog.bg[0] / 255.0f, g_fog.bg[1] / 255.0f, g_fog.bg[2] / 255.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    eng_draw_cfg cfg;
+    quad_cfg(&cfg);
+    int qi = 0, si = 0;
+    eng_draw_begin();
+    for (;;) {                               /* the merged z order, the world's part (its quads are the eye's own depth) */
+        while (si < ni && !world_sprite(&items[si])) si++;
+        if (qi >= qn && si >= ni) break;
+        const uint32_t qz = qi < qn ? (uint32_t)(qbuf[qi].zsort & 0xFFFFFF) : 0;
+        const uint32_t sz = si < ni ? items[si].z : 0;
+        if (si < ni && (qi >= qn || sz >= qz)) {
+            float xyz[4][3];
+            if (v->focal > 0.0f && sprite_eye(&items[si], v, xyz)) { eng_draw_end(); draw_sprite(&items[si], 0.0f, (const float (*)[3])xyz); eng_draw_resume(); }
+            si++;
+        } else eng_draw_quad(&qbuf[qi++], &cfg);
+    }
+    eng_draw_end();
+    screen_fade(false);
+    if (g_fog_valid && g_fog.have_gamma) eng_post_lut(g_fog.gamma, vw, vh);
+    eye_swap();
+}
+
+void ss22_draw_panel(int vw, int vh)
+{
+    if (!pass_ready()) return;
+    if (!p_blend_sep) p_blend_sep = (pfn_blend_sep)SDL_GL_GetProcAddress("glBlendFuncSeparate");
+    g_scene_x0 = 0.0f; g_scene_x1 = NW;
+    eng_hud_begin(false); g_eng_quad_dx = NULL;
+    pass_gl(vw, vh);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    panel_pass = true;
+    eng_draw_cfg cfg;
+    quad_cfg(&cfg);
+    int qi = 0, si = 0;
+    eng_draw_begin();
+    for (;;) {                               /* the merged z order, the screen's part: the game's own camera */
+        while (qi < qn && full_frame(&qbuf[qi])) qi++;
+        while (si < ni && world_sprite(&items[si])) si++;
+        if (qi >= qn && si >= ni) break;
+        const uint32_t qz = qi < qn ? (uint32_t)(qbuf[qi].zsort & 0xFFFFFF) : 0;
+        const uint32_t sz = si < ni ? items[si].z : 0;
+        if (si < ni && (qi >= qn || sz >= qz)) { eng_draw_end(); draw_sprite(&items[si], 0.0f, NULL); si++; eng_draw_resume(); }
+        else eng_draw_quad(&qbuf[qi++], &cfg);
+    }
+    eng_draw_end();
+    screen_fade(true);
+    draw_text();
+    if (g_fog_valid && g_fog.have_gamma) eng_post_lut_premul(g_fog.gamma, vw, vh);
+    panel_pass = false;
+}
+
+/* THE GUN'S RAY: a narrow eye looking along it (eng_xr.c builds it) sees whatever the ray meets at its picture's centre; the nearest
+ * such polygon's depth there -- 1/z is linear across a polygon on screen, so the triangle's barycentric weights interpolate it. */
+static void ray_quad(const geo_quad *q, void *u)
+{
+    double *best = u;
+    const geo_vert *v = q->ndv ? q->dv : q->rv;
+    const int n = q->ndv ? q->ndv : q->nrv;
+    const double px = 320.0 * 16, py = 240.0 * 16;
+    for (int i = 1; i + 1 < n; i++) {
+        const double x0 = v[0].sx16, y0 = v[0].sy16, x1 = v[i].sx16, y1 = v[i].sy16, x2 = v[i + 1].sx16, y2 = v[i + 1].sy16;
+        const double den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+        if (den == 0.0) continue;
+        const double b0 = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / den;
+        const double b1 = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / den;
+        const double b2 = 1.0 - b0 - b1;
+        if (b0 < 0.0 || b1 < 0.0 || b2 < 0.0 || v[0].z <= 0 || v[i].z <= 0 || v[i + 1].z <= 0) continue;
+        const double z = 1.0 / (b0 / v[0].z + b1 / v[i].z + b2 / v[i + 1].z);
+        if (*best <= 0.0 || z < *best) *best = z;
+        return;
+    }
+}
+bool ss22_inside_ray(eng_inside *ray, double hit[3], float *sx, float *sy)
+{
+    ray->focal = 0.0f; ray->vx = ray->vy = 0;
+    if (!ins_frame || !ins_world || !g_eng_pointrom) return false;
+    double best = 0.0;
+    eng_list_cfg lc = { ENG_LIST_HEAD_SS22, 0, NULL, NULL, NULL, NULL, NULL, ray };
+    eng_walk_list(ins_word, &lc, ray_quad, &best);
+    if (ray->focal <= 0.0f) return false;
+    const double d = best > 0.0 ? best : (double)0x1FFFFF;   /* nothing met: as far as the game's depth goes */
+    for (int k = 0; k < 3; k++) hit[k] = ray->p[k] + d * ray->r[2][k];
+    if (hit[2] < 1.0) { *sx = *sy = -1.0f; return true; }    /* behind the game's camera: off its picture */
+    *sx = (float)(320.0 + ray->vx + ray->focal * hit[0] / hit[2]);
+    *sy = (float)(240.0 + ray->vy - ray->focal * hit[1] / hit[2]);
+    return true;
 }
 
 /* ------------------------------------------------------------------ GL context helpers */

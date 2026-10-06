@@ -55,6 +55,7 @@
     GLF(glLineWidth) \
     GLF(glLoadIdentity) \
     GLF(glMatrixMode) \
+    GLF(glMultMatrixf) \
     GLF(glOrtho) \
     GLF(glPixelMapfv) \
     GLF(glPixelStorei) \
@@ -69,6 +70,7 @@
     GLF(glScalef) \
     GLF(glScissor) \
     GLF(glTexCoord2f) \
+    GLF(glTexCoord4f) \
     GLF(glTexCoordPointer) \
     GLF(glTexEnvf) \
     GLF(glTexEnvi) \

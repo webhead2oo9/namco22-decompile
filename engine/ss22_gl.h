@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "hud_edges.h"
+#include "slave_list.h"
 
 typedef struct {
     bool            walk;                   /* this update keeps the master's list (frame_rule.h); false = no 3D, sprites and text only */
@@ -52,6 +53,19 @@ bool ss22_stereo_frame(void);                /* the prepared frame has two eyes 
 void ss22_draw_eye(int eye, int vw, int vh); /* 0 left, 1 right; a mono frame draws its one picture (ss22_draw = eye 0) */
 int  ss22_quads(void);                       /* quads in the prepared frame */
 int  ss22_sprites(void);                     /* sprites in the prepared frame */
+/* INSIDE (a headset's View: Inside, engine/eng_xr.h): from the next prepare on, each frame keeps polygon RAM as its walk saw it, so
+ * eyes anywhere round the camera (engine/slave_list.h eng_inside) can walk it again. The prepared quads stay the camera's own. */
+void ss22_set_inside(bool on);
+/* One Inside eye, vw x vh pixels: the world (the full-frame viewports) walked from where it is, the world's sprites (deeper than the
+ * HUD's) with it, the screen fade over all of it, the gamma. *v's out fields come back filled (focal 0 = no world this frame). */
+void ss22_draw_inside(eng_inside *v, int vw, int vh);
+/* The Inside view's SCREEN: what is not the world -- the HUD's sprites, the text layer, sub-window viewports, every sprite of a frame
+ * with no world -- from the game's own camera, over a clear picture: its colour premultiplied by its alpha. */
+void ss22_draw_panel(int vw, int vh);
+/* THE GUN along a ray (a narrow eng_inside looking along it, from where the gun is): what it meets nearest, in the camera's view
+ * space (*hit; nothing met = the ray's far end), and where the game's own camera puts that on its 640 x 480 picture (behind it:
+ * -1, -1). false = the frame has no world. */
+bool ss22_inside_ray(eng_inside *ray, double hit[3], float *sx, float *sy);
 
 /* An OpenGL 2.1 compatibility context, the way the engine wants it (alpha channel, double buffered). */
 void eng_gl_context_attributes(void);

@@ -8,10 +8,18 @@
  * THE SCREEN is two quad layers at one place in the room (LOCAL space), one per eye (eyeVisibility LEFT / RIGHT), each eye's picture
  * drawn by the game's renderer from that eye (eng_xr_stereo: engine/slave_list.h eng_eye). The runtime composites them at the
  * headset's own rate, so looking around is smooth whatever the game's 60 Hz. The VR settings (any menu shows them: eng_xr_rows):
+ *   View             (a game that draws one) the screen, or INSIDE the game's world -- below
  *   Screen distance  D (m); the world's depth D * units_per_m shows ON the screen, nearer things stand out in front of it
  *   Screen size      100 % = the 4:3 picture spans the game's own field of view (life size), wider with widescreen
  *   3D depth         the eyes' distance: 100 % = 64 mm at the game's scale, 0 = a flat screen
  *   Recenter         the screen straight in front of you again
+ * INSIDE (View: Inside the game's world): the game's camera is your head where it was at the last recenter (facing that way, the
+ * horizon level), and the headset looks round the game's world from there -- each eye drawn by the game's renderer from where that
+ * eye is, through the headset's own field of view (engine/slave_list.h eng_inside), a projection layer; your head's every move
+ * moves the eye (3D depth scales them with the eyes' distance: the world's scale). What is not the world -- the HUD's sprites, the
+ * text layer, sub-window viewports -- stays on the screen, which is clear wherever the game drew nothing there: a quad layer over
+ * the world, at the screen's distance and size. The light gun aims at the world: the host finds what the ray meets and where the
+ * game's own camera sees it (eng_xr_host.inside_aim). The window shows the left eye with the screen over it.
  * THE CONTROLLERS. A light-gun game: the aim ray hits the screen's plane, inside the 4:3 picture is where the gun points, anywhere else
  * is off-screen (a reload shot); trigger = the trigger, grip = the pedal, A / X = coin, B / Y = recenter. Any other game: the two
  * controllers are one game pad (eng_xr_get_pad): the sticks, the triggers, the grips as the shoulders, A B (right) X Y (left), a left
@@ -21,7 +29,8 @@
  * Vive: a right trackpad click; the Frame: View); then the controller is a pointer (the trigger clicks), the stick steps, A is OK, B / Y
  * go back.
  * TESTS: ENG_XRTIME=1 logs where a headset frame's time goes (and the headset's rate) every 600 frames; ENG_XRPAD=1 logs every change
- * of what the controllers give the game.
+ * of what the controllers give the game; ENG_XR_INSIDE_PX=<px> holds an Inside eye's picture to that size (1600 by default);
+ * ENG_XR_MIRROR=2 shows both eyes side by side in the window (a recording of the whole view), not the left one.
  */
 #ifndef ENG_XR_H
 #define ENG_XR_H
@@ -29,6 +38,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <SDL2/SDL.h>
+#include "slave_list.h"
 
 /* THE HOST'S SIDE: what eng_xr needs from the program it runs in. eng_xr.c links nothing of any host (the Super 22 games' eng_ui.c,
  * Rave Racer's rr_ui.c, Prop Cycle's ui_menu.c): each fills this in. */
@@ -41,6 +51,10 @@ typedef struct {
     bool  (*menu_open)(void);                /* the host's menu is open: the controllers drive it, not the game */
     int   (*cfg_get)(const char *key, int def);   /* the host's settings file, for the VR settings; NULL = defaults, not kept */
     void  (*cfg_set)(const char *key, int v);
+    bool    inside;                          /* the host draws an Inside view (eng_xr_present's ENG_XR_INSIDE and ENG_XR_SCREEN) */
+    /* INSIDE, a light-gun game: the gun's ray (an eng_inside looking along it, in the game camera's space) -> where the game's camera
+     * sees what it meets, in the 4:3 picture, 0..1 each way; *on = on it. false = this frame has no world (the screen's plane aims). */
+    bool  (*inside_aim)(eng_inside *ray, float *nx, float *ny, bool *on);
 } eng_xr_host;
 
 /* With the window's OpenGL context current: an OpenXR session that shares it (*host is copied). false = no VR (the reason is printed):
@@ -61,12 +75,20 @@ void eng_xr_stereo(int32_t *sep, int32_t *zconv, float *focal_max);
 /* ONE HOST FRAME IN THE HEADSET. draw_eye(eye, w, h, u) draws the game's picture for that eye (0 left, 1 right) into the bound eye
  * picture, w x h pixels, the viewport already set; draw_menu(u), when menu_visible, draws the host's menu (Nuklear) once, into an
  * overlay the size of the window's drawable, which lies over both eyes' pictures with the pointer's dot on it. The window then shows
- * the left eye, letterboxed: *mirror is that rectangle (drawable pixels, from the top-left). false = no session: draw the window. */
+ * the left eye, letterboxed: *mirror is that rectangle (drawable pixels, from the top-left). false = no session: draw the window.
+ * INSIDE (eng_xr_inside): draw_eye gets ENG_XR_INSIDE + 0 and + 1 instead -- the world from each eye (eng_xr_inside_eye) -- then
+ * ENG_XR_SCREEN, the screen's picture over a clear one, its colour premultiplied by its alpha; the menu goes on the screen. */
+enum { ENG_XR_INSIDE = 2, ENG_XR_SCREEN = 4 };
 bool eng_xr_present(SDL_Window *win, void (*draw_eye)(int eye, int w, int h, void *u), void (*draw_menu)(void *u),
                     bool menu_visible, void *u, bool sharp, SDL_Rect *mirror);
-void eng_xr_eye_size(int *w, int *h);      /* the eye pictures' size (0 x 0 before the first) */
+void eng_xr_eye_size(int *w, int *h);      /* the eye pictures' size (0 x 0 before the first; Inside, its eyes') */
 bool eng_xr_read_eye(int eye);             /* that eye's last picture as GL's read framebuffer (screenshots); false = none */
 void eng_xr_read_done(void);
+bool eng_xr_inside(void);                  /* the frames are Inside ones (View: Inside, and the host draws them) */
+void eng_xr_inside_eye(int eye, eng_inside *v);   /* this frame's eye 0 / 1 in the game camera's space (during eng_xr_present) */
+/* THE HEADSET'S NEXT FRAME: *ns = nanoseconds until the runtime is expected to want its next picture (xrWaitFrame's next return,
+ * estimated from the last one and the headset's period; <= 0 = already). false = no session or no frame yet. */
+bool eng_xr_next_frame(int64_t *ns);
 
 /* THE GUN (a light-gun game): where the controller points in the 4:3 picture, 0..1 each way; inside = on it. false = not tracked. */
 bool eng_xr_gun(float *nx, float *ny, bool *inside);

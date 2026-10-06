@@ -8,6 +8,7 @@
  * Keys: Esc opens the menu (File / Display / Audio / Controls; pad R3 too), P pause, F11 or Alt+Enter fullscreen, F12
  * screenshot (screenshots/), and the cabinet's (the game's input module, rebindable in the menu).
  */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,10 +40,22 @@ static bool paused, shot_pending, headless_open, restart_req;
 static eng_vsync vs;                               /* the frame pacer (engine/eng_vsync.h) */
 static bool xr_on;                                 /* --vr: an OpenXR session shares the window's GL context (engine/eng_xr.h) */
 static bool stereo_shots;                          /* ENG_STEREO_SHOTS: headless --shots also write each eye */
+static struct { bool on; double yaw, pitch, fov, p[3]; } ins_shot;   /* ENG_INSIDE_SHOTS: headless --shots also write an Inside eye */
 /* the headset's side of the menu and the settings (engine/eng_xr.h eng_xr_host) */
 static bool xr_wide(void) { return g_eng_disp.wide != 0; }
 static void xr_cfg_set(const char *key, int v) { eng_cfg_set_int(key, v); }
 static const eng_ui_page xr_page = { "VR", 520, 150, 0, eng_xr_rows, eng_xr_row_value, NULL, eng_xr_row_text, eng_xr_row_change, eng_xr_notes };
+/* INSIDE, the light gun: what the controller's ray meets (engine/ss22_gl.h ss22_inside_ray), and where the game's camera sees it */
+static bool   ins_hit_ok;
+static double ins_hit[3];                          /* the camera's space: where the crosshair goes in each eye */
+static bool xr_inside_aim(eng_inside *ray, float *nx, float *ny, bool *on)
+{
+    float sx, sy;
+    if (!(ins_hit_ok = ss22_inside_ray(ray, ins_hit, &sx, &sy))) return false;
+    *nx = sx / 640.0f; *ny = sy / 480.0f;
+    *on = sx >= 0.0f && sx < 640.0f && sy >= 0.0f && sy < 480.0f;
+    return true;
+}
 
 static uint64_t now_ns(void)                     /* split the scaling: counter * 1e9 overflows 64 bits (and this works on Windows too) */
 {
@@ -99,7 +112,8 @@ bool ss22_host_open(const ss22_host_game *g, int scale, bool fs, bool vr)      /
     if (game->extra_page) eng_ui_add_page(game->extra_page());
     if (vr) {                                        /* the headset: the window shows the left eye; while a session runs the pacer's timer paces the game
                                                       * (eng_vsync_headset; xrWaitFrame paces the headset) */
-        const eng_xr_host xh = { game->title, game->units_per_m, game->hfov_deg, game->aim != NULL, xr_wide, eng_ui_is_open, eng_cfg_int, xr_cfg_set };
+        const eng_xr_host xh = { game->title, game->units_per_m, game->hfov_deg, game->aim != NULL, xr_wide, eng_ui_is_open, eng_cfg_int, xr_cfg_set,
+                                 game->vr_inside, game->vr_inside && game->aim ? xr_inside_aim : NULL };
         xr_on = eng_xr_start(&xh);
         if (xr_on) eng_ui_add_page(&xr_page);
         else fprintf(stderr, "[HOST] no VR: playing in the window\n");
@@ -126,7 +140,28 @@ bool ss22_host_open_headless(void)
     /* ENG_STEREO_SHOTS=<sep>:<zconv>[:<focal_max>] (tests): the two eyes a headset gets (engine/ss22_gl.h ss22_set_stereo, the game's
      * units; no focal_max = no limit); every --shots picture is the left eye, with <name>_L.ppm and <name>_R.ppm beside it */
     if ((e = getenv("ENG_STEREO_SHOTS"))) { int s = 0, z = 0; float f = 0; sscanf(e, "%d:%d:%f", &s, &z, &f); ss22_set_stereo(s, z, f); stereo_shots = s > 0; }
+    /* ENG_INSIDE_SHOTS=<yaw>:<pitch>[:<hfov>[:<x>:<y>:<z>]] (tests): an Inside eye (engine/eng_xr.h) turned yaw degrees right and pitch
+     * up, its frustum hfov wide (100 by default) by the picture's shape, at x, y, z in the camera's space (the game's units): every
+     * --shots picture gets <name>_I.ppm (the eye) and <name>_S.ppm (the screen over black) beside it, and a line saying what the
+     * eye's centre ray meets and where the game's own camera sees that (the light gun's) */
+    if ((e = getenv("ENG_INSIDE_SHOTS"))) {
+        ins_shot.fov = 100;
+        if (sscanf(e, "%lf:%lf:%lf:%lf:%lf:%lf", &ins_shot.yaw, &ins_shot.pitch, &ins_shot.fov, &ins_shot.p[0], &ins_shot.p[1], &ins_shot.p[2]) >= 2) {
+            ins_shot.on = true; ss22_set_inside(true);
+        }
+    }
     return headless_open;
+}
+
+/* ENG_INSIDE_SHOTS' eye (and its centre ray, tan +-t wide): yaw about y (right +), pitch about x (up +) */
+static void shot_eye(eng_inside *v, double t, double aspect)
+{
+    const double y = ins_shot.yaw * M_PI / 180.0, p = ins_shot.pitch * M_PI / 180.0;
+    memset(v, 0, sizeof *v);
+    const double f[3] = { sin(y) * cos(p), sin(p), cos(y) * cos(p) }, r[3] = { cos(y), 0.0, -sin(y) };
+    for (int k = 0; k < 3; k++) { v->r[0][k] = r[k]; v->r[2][k] = f[k]; v->p[k] = ins_shot.p[k]; }
+    v->r[1][0] = f[1] * r[2] - f[2] * r[1]; v->r[1][1] = f[2] * r[0] - f[0] * r[2]; v->r[1][2] = f[0] * r[1] - f[1] * r[0];   /* forward x right */
+    v->tr = t; v->tl = -t; v->tu = t / aspect; v->td = -t / aspect;
 }
 
 void ss22_host_shot(const char *path)
@@ -149,6 +184,23 @@ void ss22_host_shot(const char *path)
                 ss22_draw_eye(eye, vw, vh);
                 eng_gl_write_ppm(p, vw, vh);
             }
+        if (ins_shot.on) {
+            char p[1024]; const size_t n = strlen(path);
+            eng_inside v, ray;
+            shot_eye(&v, tan(ins_shot.fov * M_PI / 360.0), (double)vw / vh);
+            snprintf(p, sizeof p, "%.*s_I.ppm", (int)(n > 4 ? n - 4 : n), path);
+            ss22_draw_inside(&v, vw, vh);
+            eng_gl_write_ppm(p, vw, vh);
+            snprintf(p, sizeof p, "%.*s_S.ppm", (int)(n > 4 ? n - 4 : n), path);
+            ss22_draw_panel(vw, vh);
+            eng_gl_write_ppm(p, vw, vh);
+            shot_eye(&ray, 0.02, 1.0);
+            double hit[3]; float sx, sy;
+            if (ss22_inside_ray(&ray, hit, &sx, &sy))
+                fprintf(stderr, "[INSIDE] %s: the eye's centre meets %.0f, %.0f, %.0f; the game's camera (lens %.1f) sees it at %.1f, %.1f\n",
+                        path, hit[0], hit[1], hit[2], ray.focal, sx, sy);
+            else fprintf(stderr, "[INSIDE] %s: no world\n", path);
+        }
         ss22_draw(vw, vh);
         eng_gl_write_ppm(path, vw, vh);
     }
@@ -204,11 +256,28 @@ static SDL_Rect present_window(int *rw, int *rh)
 }
 
 /* THE HEADSET (--vr): each eye into its picture -- the gun's crosshair at the same place in both, ON the screen's plane, where the
- * aim ray meets it -- and the menu over both; the window shows the left eye (engine/eng_xr.c eng_xr_present). */
-typedef struct { bool cross; float ax, ay; } xr_frame;
+ * aim ray meets it -- and the menu over both; the window shows the left eye (engine/eng_xr.c eng_xr_present).
+ * INSIDE: each eye's world, its crosshair where the gun's ray meets the world (so it sits at that depth, in both eyes, on or off the
+ * game's own picture: off it, a shot reloads); then the screen. */
+typedef struct { bool cross, icross; float ax, ay; } xr_frame;
 static void xr_eye(int eye, int w, int h, void *u)
 {
     const xr_frame *f = u;
+    if (eye == ENG_XR_SCREEN) { ss22_draw_panel(w, h); return; }
+    if (eye >= ENG_XR_INSIDE) {
+        eng_inside v;
+        eng_xr_inside_eye(eye - ENG_XR_INSIDE, &v);
+        ss22_draw_inside(&v, w, h);
+        double e[3];
+        for (int j = 0; j < 3; j++) e[j] = v.r[j][0] * (ins_hit[0] - v.p[0]) + v.r[j][1] * (ins_hit[1] - v.p[1]) + v.r[j][2] * (ins_hit[2] - v.p[2]);
+        if (f->icross && ins_hit_ok && e[2] > 1.0) {
+            glViewport(0, 0, w, h);
+            glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 640, 480, 0, -1, 1);
+            glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+            draw_cross((float)(640.0 * (e[0] / e[2] - v.tl) / (v.tr - v.tl)), (float)(480.0 * (v.tu - e[1] / e[2]) / (v.tu - v.td)), 12.0f);
+        }
+        return;
+    }
     ss22_draw_eye(eye, w, h);
     if (f->cross) {                                  /* scene units: the 4:3 picture is 0..640 x 0..480 in either shape */
         glViewport(0, 0, w, h);
@@ -220,8 +289,9 @@ static void xr_eye(int eye, int w, int h, void *u)
 static void xr_menu(void *u) { (void)u; bool quit = false; eng_ui_draw(&quit); }
 static SDL_Rect present_xr(int *rw, int *rh)
 {
-    xr_frame f = { false, 0, 0 };
-    f.cross = game->aim && g_eng_disp.crosshair && !eng_ui_is_open() && game->aim(&f.ax, &f.ay);
+    xr_frame f = { false, false, 0, 0 };
+    f.icross = game->aim && g_eng_disp.crosshair && !eng_ui_is_open();
+    f.cross = f.icross && game->aim(&f.ax, &f.ay);
     SDL_Rect r = { 0, 0, 0, 0 };
     eng_xr_present(win, xr_eye, xr_menu, eng_ui_visible(), &f, eng_disp_sharp(), &r);
     eng_xr_eye_size(rw, rh);
@@ -240,7 +310,13 @@ static void present(void)
 {
     int rw, rh;
     const bool xr = xr_on && eng_xr_running();
-    if (xr_on) { int32_t sep = 0, zc = 0; float fm = 0; if (xr) eng_xr_stereo(&sep, &zc, &fm); ss22_set_stereo(sep, zc, fm); }   /* the eyes, from the next prepare on */
+    if (xr_on) {                                     /* the eyes, from the next prepare on: a stereo pair before a screen, or Inside ones */
+        int32_t sep = 0, zc = 0; float fm = 0;
+        const bool in = xr && eng_xr_inside();
+        if (xr && !in) eng_xr_stereo(&sep, &zc, &fm);
+        ss22_set_stereo(sep, zc, fm);
+        ss22_set_inside(in);
+    }
     const SDL_Rect r = xr ? present_xr(&rw, &rh) : present_window(&rw, &rh);
     pic_r = r; gun_r = r;
     if (xr || g_eng_disp.wide) { const int w = (int)(r.h * 4.0 / 3.0 + 0.5); gun_r.x = r.x + (r.w - w) / 2; gun_r.w = w; }   /* the 2D layers and the gun stay 4:3 */
@@ -335,7 +411,24 @@ static bool pump(void)
     return !quit;
 }
 
-static void pace(void) { eng_vsync_after_frame(&vs, win); }
+/* INSIDE AT THE HEADSET'S RATE: the game makes 59.906 pictures a second and the headset shows 72 or 90. One picture per game frame
+ * leaves the runtime to show some twice, from where the head WAS -- a stutter every few frames. Inside's eyes walk the frame's copy
+ * again wherever the head is now, so between game frames the headset gets this one again whenever the next game frame could not be
+ * ready for the headset's next frame: due later than it, or its emulation (game_ns: the game's own part of a frame, the time the
+ * host is away, its worst recent value decaying) would end after it. The game keeps its timer; only the headset sees more. */
+static uint64_t game_ns = 4000000ull, host_left;
+static void pace(void)
+{
+    if (g_eng_disp_headset && eng_xr_inside() && !eng_ui_is_open())
+        for (int n = 0; n < 4; n++) {                /* (4: a bound, should the runtime's clock say nonsense) */
+            int64_t slot;
+            if (!eng_xr_next_frame(&slot)) break;
+            const uint64_t now = eng_vsync_ns(), due = vs.next_ns + ENG_FRAME_NS;   /* the next game frame: eng_vsync_after_frame's wait */
+            if ((int64_t)((due > now ? due - now : 0) + game_ns) <= slot) break;
+            present();
+        }
+    eng_vsync_after_frame(&vs, win);
+}
 
 bool ss22_host_pointer(float *nx, float *ny, bool *inside)
 {
@@ -374,6 +467,8 @@ bool ss22_host_frame(void)
     g_eng_disp_headset = xr_on && eng_xr_running();
     eng_vsync_headset(&vs, g_eng_disp_headset);      /* a VR session: its pictures, the game on the timer */
     eng_vsync_want(&vs, g_eng_disp.fps);            /* Display > Frame rate (the window's; not while the headset shows the pictures) */
+    { const uint64_t t = eng_vsync_ns(), s = host_left && t > host_left ? t - host_left : game_ns;   /* (pace's game_ns) */
+      game_ns = s > game_ns ? s : game_ns - (game_ns - s) / 16; }
     if (eng_vsync_show(&vs)) present_with(&pl);     /* a lock below 60 shows only some frames */
     if (ftm) clock_gettime(CLOCK_MONOTONIC, &a2);
     pace();
@@ -394,6 +489,7 @@ bool ss22_host_frame(void)
         }
         if (!paused && !eng_ui_is_open()) eng_vsync_resync(&vs);
     }
+    host_left = eng_vsync_ns();
     return true;
 }
 

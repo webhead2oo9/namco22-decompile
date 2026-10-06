@@ -26,6 +26,7 @@ typedef struct {
     const eng_ui_page *(*extra_page)(void);  /* the game's own menu page after Controls (Time Crisis: Stages); NULL = none */
     int32_t units_per_m;                     /* the game's view-space units in a metre, for a VR headset's stereo (engine/eng_xr.h); 0 = 15000 */
     float   hfov_deg;                        /* its horizontal field of view across 4:3, the headset's "Screen size 100 %"; 0 = 45 */
+    bool    vr_inside;                       /* the headset may look round its world (View: Inside, engine/eng_xr.h) */
 } ss22_host_game;
 
 /* a real window; scale <= 0 = the saved window size. vr: the picture in an OpenXR headset as well (engine/eng_xr.h), when one is there */

@@ -130,7 +130,7 @@ static int     g_lit_n, g_lit_idx;
 static void register_normals(uint32_t addr)
 {
     const int32_t (*v)[3] = g_view.viewq;
-    const int32_t (*m)[3] = g_view.m;
+    const int32_t (*m)[3] = g_view.have_lm ? g_view.lm : g_view.m;   /* an Inside eye: the camera's own (geo_hw.h) */
     int32_t cl[3];
     for (int c = 0; c < 3; c++)
         cl[c] = (int32_t)(((int64_t)g_view.light[0] * v[0][c] +

@@ -33,12 +33,31 @@ void eng_eye_view(eng_eye *e, geo_view *gv, float focal);
 double eng_fov_probe_k(void);
 void eng_fov_probe(geo_view *gv);
 
+/* INSIDE: an eye anywhere around the game's camera -- a VR headset's, looking round the game's world from where the camera is
+ * (engine/eng_xr.h, View: Inside). Its place p and its axes r (rows: its right, its up, its forward) are in the camera's view
+ * space (x right, y up, z forward; the game's units), so a point v of that space is r (v - p) to the eye; its picture is the
+ * frustum tl .. tr (tangents, the left one negative) by td .. tu (the bottom one negative) laid over the 640 x 480 picture, in
+ * whatever pixels it is drawn at. Only FULL-FRAME viewports are the world: every other one (a radar's, a mirror's, a sub-window)
+ * is left out of an Inside walk -- it is the screen's, drawn from the game's own camera. The geometry stage needs nothing new:
+ * the eye's turn, its place and the frustum's stretch are all one affine map of the object's view (eng_inside_view), and the
+ * back faces, the near plane at z = 1, the guard band and the depth order all follow from it as they did from the camera. The
+ * lighting keeps the camera's own matrix (geo_hw.h have_lm).
+ *   The walk reports the camera's own lens and centre (the last full-frame viewport's): what the game's light gun sees through. */
+typedef struct {
+    double  r[3][3], p[3];  /* in: the eye in the camera's view space */
+    double  tl, tr, tu, td; /* in: its frustum's tangents */
+    float   focal;          /* out: the full-frame viewport's lens, pixels (0 = no world this frame) */
+    int32_t vx, vy;         /* out: its centre's offset from (320, 240) */
+} eng_inside;
+void eng_inside_view(const eng_inside *in, geo_view *gv, float focal);
+
 typedef struct {
     int head;               /* ENG_LIST_HEAD_SS22 (0x304) or ENG_LIST_HEAD_S22 (0x2FF) */
     int s22_objectflags;    /* System 22: the 0x10 record carries object flags */
     /* optional: the last viewport's projection, for callers that report it */
     int32_t *out_zoom_mant; int *out_zoom_shift; int32_t *out_vx, *out_vy;
     eng_eye *eye;           /* NULL = the game's own camera */
+    eng_inside *inside;     /* an Inside eye instead (eye is then ignored); NULL = none */
 } eng_list_cfg;
 #define ENG_LIST_HEAD_SS22 0x304
 #define ENG_LIST_HEAD_S22  0x2FF

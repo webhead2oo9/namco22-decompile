@@ -11,6 +11,7 @@
  * copy -- exact, but on NVIDIA that path is a CPU round trip and costs a
  * whole frame.
  */
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <SDL2/SDL.h>
@@ -54,7 +55,7 @@ static pfn_uniform1i      p_uniform1i;
 static pfn_active_texture p_active_texture;
 
 static int    state;             /* 0 untried, 1 shader, -1 pixel-map fallback */
-static GLuint prog, frame_tex, lut_tex;
+static GLuint prog, prog_pre, frame_tex, lut_tex;
 static int    frame_w, frame_h;
 
 static const char *FS =
@@ -68,6 +69,43 @@ static const char *FS =
     "                        texture2D(lut, vec2(k.g, 0.5)).g,\n"
     "                        texture2D(lut, vec2(k.b, 0.5)).b, 1.0);\n"
     "}\n";
+/* the same over premultiplied colour (eng_post_lut_premul): a clear pixel stays clear -- the table's black need not be black */
+static const char *FS_PRE =
+    "uniform sampler2D frame;\n"
+    "uniform sampler2D lut;\n"
+    "void main() {\n"
+    "    vec4 f = texture2D(frame, gl_TexCoord[0].st);\n"
+    "    if (f.a <= 0.0) gl_FragColor = vec4(0.0);\n"
+    "    else {\n"
+    "        vec3 k = min(f.rgb / f.a, 1.0) * (255.0 / 256.0) + 0.5 / 256.0;\n"
+    "        gl_FragColor = vec4(vec3(texture2D(lut, vec2(k.r, 0.5)).r, texture2D(lut, vec2(k.g, 0.5)).g,\n"
+    "                                 texture2D(lut, vec2(k.b, 0.5)).b) * f.a, f.a);\n"
+    "    }\n"
+    "}\n";
+
+static GLuint make_program(const char *src)
+{
+    GLuint fs = p_create_shader(GL_FRAGMENT_SHADER);
+    p_shader_source(fs, 1, &src, NULL);
+    p_compile(fs);
+    GLint ok = 0;
+    p_get_shader_iv(fs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512]; p_get_shader_log(fs, sizeof log, NULL, log);
+        fprintf(stderr, "[POST] shader: %s\n", log);
+        return 0;
+    }
+    GLuint p = p_create_program();
+    p_attach(p, fs);
+    p_link(p);
+    p_get_program_iv(p, GL_LINK_STATUS, &ok);
+    if (!ok) return 0;
+    p_use(p);
+    p_uniform1i(p_uniform_loc(p, "frame"), 0);
+    p_uniform1i(p_uniform_loc(p, "lut"), 1);
+    p_use(0);
+    return p;
+}
 
 static int init_shader(void)
 {
@@ -86,25 +124,8 @@ static int init_shader(void)
     LOAD(p_uniform1i, pfn_uniform1i, "glUniform1i");
     LOAD(p_active_texture, pfn_active_texture, "glActiveTexture");
 #undef LOAD
-    GLuint fs = p_create_shader(GL_FRAGMENT_SHADER);
-    p_shader_source(fs, 1, &FS, NULL);
-    p_compile(fs);
-    GLint ok = 0;
-    p_get_shader_iv(fs, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[512]; p_get_shader_log(fs, sizeof log, NULL, log);
-        fprintf(stderr, "[POST] shader: %s\n", log);
-        return 0;
-    }
-    prog = p_create_program();
-    p_attach(prog, fs);
-    p_link(prog);
-    p_get_program_iv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) return 0;
-    p_use(prog);
-    p_uniform1i(p_uniform_loc(prog, "frame"), 0);
-    p_uniform1i(p_uniform_loc(prog, "lut"), 1);
-    p_use(0);
+    if (!(prog = make_program(FS))) return 0;
+    prog_pre = make_program(FS_PRE);                  /* without it a premultiplied picture takes the pixel map's way */
     glGenTextures(1, &lut_tex);
     glBindTexture(GL_TEXTURE_2D, lut_tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -115,22 +136,22 @@ static int init_shader(void)
     return 1;
 }
 
-static void full_quad(void)
+static void full_quad(float s, float t)              /* the frame texture's used corner: s x t of it */
 {
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
     glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
     glColor4f(1, 1, 1, 1);
     glBegin(GL_QUADS);
     glTexCoord2f(0, 0); glVertex2f(0, 0);
-    glTexCoord2f(1, 0); glVertex2f(1, 0);
-    glTexCoord2f(1, 1); glVertex2f(1, 1);
-    glTexCoord2f(0, 1); glVertex2f(0, 1);
+    glTexCoord2f(s, 0); glVertex2f(1, 0);
+    glTexCoord2f(s, t); glVertex2f(1, 1);
+    glTexCoord2f(0, t); glVertex2f(0, 1);
     glEnd();
     glMatrixMode(GL_PROJECTION); glPopMatrix();
     glMatrixMode(GL_MODELVIEW);  glPopMatrix();
 }
 
-void eng_post_lut(const uint8_t lut[3][256], int vw, int vh)
+static void post_lut(const uint8_t lut[3][256], int vw, int vh, bool premul)
 {
     if (state == 0) {
         state = init_shader() ? 1 : -1;
@@ -138,17 +159,20 @@ void eng_post_lut(const uint8_t lut[3][256], int vw, int vh)
     }
     glDisable(GL_BLEND); glDisable(GL_ALPHA_TEST); glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, vw, vh);
-    if (!frame_tex || frame_w != vw || frame_h != vh) {
+    /* the copy's texture only grows: a headset's Inside view takes three sizes a frame (its two eyes, its screen) */
+    if (!frame_tex || frame_w < vw || frame_h < vh) {
+        const int fw = frame_w > vw ? frame_w : vw, fh = frame_h > vh ? frame_h : vh;
         if (!frame_tex) glGenTextures(1, &frame_tex);
         glBindTexture(GL_TEXTURE_2D, frame_tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vw, vh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        frame_w = vw; frame_h = vh;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fw, fh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        frame_w = fw; frame_h = fh;
     }
-    if (state > 0) {
+    const float s = (float)vw / (float)frame_w, t = (float)vh / (float)frame_h;
+    if (state > 0 && (!premul || prog_pre)) {
         uint8_t rgb[256][3];
         for (int v = 0; v < 256; v++) { rgb[v][0] = lut[0][v]; rgb[v][1] = lut[1][v]; rgb[v][2] = lut[2][v]; }
         p_active_texture(GL_TEXTURE1);
@@ -159,12 +183,12 @@ void eng_post_lut(const uint8_t lut[3][256], int vw, int vh)
         p_active_texture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, frame_tex);
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, vw, vh);
-        p_use(prog);
-        full_quad();
+        p_use(premul ? prog_pre : prog);
+        full_quad(s, t);
         p_use(0);
         return;
     }
-    /* fallback: the pixel map applies during the copy */
+    /* fallback: the pixel map applies during the copy (premultiplied: the alpha kept, a clear pixel's colour not) */
     GLfloat map[3][256];
     for (int c = 0; c < 3; c++) for (int v = 0; v < 256; v++) map[c][v] = lut[c][v] / 255.0f;
     glPixelMapfv(GL_PIXEL_MAP_R_TO_R, 256, map[0]);
@@ -175,6 +199,10 @@ void eng_post_lut(const uint8_t lut[3][256], int vw, int vh)
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, vw, vh);
     glPixelTransferi(GL_MAP_COLOR, GL_FALSE);
     glEnable(GL_TEXTURE_2D);
-    full_quad();
+    if (premul) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+    full_quad(s, t);
+    if (premul) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_TEXTURE_2D);
 }
+void eng_post_lut(const uint8_t lut[3][256], int vw, int vh)        { post_lut(lut, vw, vh, false); }
+void eng_post_lut_premul(const uint8_t lut[3][256], int vw, int vh) { post_lut(lut, vw, vh, true); }

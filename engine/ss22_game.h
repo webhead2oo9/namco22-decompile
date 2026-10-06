@@ -88,6 +88,9 @@ typedef struct ss22_game {
     /* its own horizontal field of view across the 4:3 picture: 2 atan(320 / focal length in pixels) -- the headset's "Screen size 100 %"
      * (life size); 0 = 45, Time Crisis' (focal 772.6) */
     float   hfov_deg;
+    /* VR, View: Inside (engine/eng_xr.h): the headset looks round the game's world from its camera. A game whose world is all round its
+     * camera (ENG_FOV_PROBE shows what it sends beyond its own view: Tokyo Wars sends nothing beside or behind) */
+    bool    vr_inside;
 } ss22_game;
 
 /* Run the game's start script NAME (ss22_game.start) from now: its frame n counts from this call. The Esc menu's way to --stage. */

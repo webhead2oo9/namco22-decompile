@@ -55,7 +55,7 @@
     F(xrCreateReferenceSpace) F(xrDestroySpace) F(xrLocateSpace) \
     F(xrEnumerateSwapchainFormats) F(xrCreateSwapchain) F(xrDestroySwapchain) F(xrEnumerateSwapchainImages) \
     F(xrAcquireSwapchainImage) F(xrWaitSwapchainImage) F(xrReleaseSwapchainImage) \
-    F(xrWaitFrame) F(xrBeginFrame) F(xrEndFrame) F(xrLocateViews) \
+    F(xrWaitFrame) F(xrBeginFrame) F(xrEndFrame) F(xrLocateViews) F(xrEnumerateViewConfigurationViews) \
     F(xrStringToPath) F(xrCreateActionSet) F(xrCreateAction) F(xrSuggestInteractionProfileBindings) F(xrAttachSessionActionSets) \
     F(xrCreateActionSpace) F(xrSyncActions) F(xrGetActionStateFloat) F(xrGetActionStateBoolean) F(xrGetActionStateVector2f) \
     F(xrApplyHapticFeedback) F(xrGetOpenGLGraphicsRequirementsKHR)
@@ -111,6 +111,7 @@ static eye_chain bg;
 
 static XrFrameState fstate;
 static XrTime last_time;                     /* the last predicted display time (0 = no frame yet) */
+static Uint64 wait_ret;                      /* SDL's counter when xrWaitFrame last let a frame go (0 = none yet) */
 static bool frame_open, frame_render;
 
 /* the screen: in LOCAL space, facing the player at the last recenter */
@@ -119,6 +120,18 @@ static bool menu_now;                        /* the host's menu was open at the 
 static double anchor_yaw;
 static XrVector3f anchor_pos;
 static bool recenter_pending = true;
+
+/* INSIDE (View: Inside, eng_xr.h): the game's world round the head -- one picture per eye at the headset's own size and field of
+ * view, a projection layer at the eyes' poses; the game's screen (its HUD and everything else that is not the world) is chain[0],
+ * a quad layer where the screen is, seen through wherever the game drew nothing */
+static int vr_view;                          /* 0 = the screen, 1 = inside (when the host draws one: host.inside) */
+static eye_chain ich[2];
+static GLuint ins_tex[2], ins_fbo[2];
+static int ins_w, ins_h;                     /* those pictures' size (0 = not made) */
+static int ins_rw, ins_rh;                   /* the runtime's recommended size of an eye's picture */
+static XrView ins_v[2];                      /* this frame's eyes, where frame_begin located them */
+static bool ins_frame, have_ins;             /* this frame draws Inside; the last frame drawn was */
+static bool inside_on(void) { return vr_view == 1 && host.inside; }
 
 /* the controllers */
 static XrActionSet aset;
@@ -187,6 +200,40 @@ void eng_xr_stereo(int32_t *sep, int32_t *zconv, float *focal_max)
      * is held to that. Depth is left out on purpose: it is the player's own scale for every lens (above 100 % the far world goes
      * past infinity: asked for), and putting it in would cancel it for the game's own lens. */
     *focal_max = (float)(320.0 / tan(half_fov) * 100.0 / vr_size);
+}
+
+/* INSIDE: the game's camera is the head at the last recenter, facing its yaw with the horizon level. A place in LOCAL space as the
+ * camera sees it: turned into the anchor's frame, OpenXR's -z forward made the game's +z, metres made the game's units (units_per_m
+ * times 3D depth -- the eyes' distance and the head's every move alike: the world's scale); a direction the same, unscaled. */
+static void cam_point(XrVector3f w, double o[3])
+{
+    const XrVector3f d = rot_y((XrVector3f){ w.x - anchor_pos.x, w.y - anchor_pos.y, w.z - anchor_pos.z }, -anchor_yaw);
+    const double s = upm * vr_depth / 100.0;
+    o[0] = d.x * s; o[1] = d.y * s; o[2] = -d.z * s;
+}
+static void cam_dir(XrQuaternionf q, XrVector3f v, double o[3])
+{
+    const XrVector3f d = rot_y(quat_rot(q, v), -anchor_yaw);
+    o[0] = d.x; o[1] = d.y; o[2] = -d.z;
+}
+bool eng_xr_inside(void) { return running && inside_on(); }
+bool eng_xr_next_frame(int64_t *ns)
+{
+    if (!running || !wait_ret || fstate.predictedDisplayPeriod <= 0) return false;
+    const double since = (double)(SDL_GetPerformanceCounter() - wait_ret) * 1e9 / (double)SDL_GetPerformanceFrequency();
+    *ns = (int64_t)((double)fstate.predictedDisplayPeriod - since);
+    return true;
+}
+void eng_xr_inside_eye(int e, eng_inside *in)
+{
+    const XrView *v = &ins_v[e & 1];
+    memset(in, 0, sizeof *in);
+    cam_point(v->pose.position, in->p);
+    cam_dir(v->pose.orientation, (XrVector3f){ 1, 0, 0 }, in->r[0]);
+    cam_dir(v->pose.orientation, (XrVector3f){ 0, 1, 0 }, in->r[1]);
+    cam_dir(v->pose.orientation, (XrVector3f){ 0, 0, -1 }, in->r[2]);
+    in->tl = tan(v->fov.angleLeft); in->tr = tan(v->fov.angleRight);
+    in->tu = tan(v->fov.angleUp);   in->td = tan(v->fov.angleDown);
 }
 
 /* ---- the loader ---------------------------------------------------------------------------------------------------------------- */
@@ -271,53 +318,81 @@ static bool gl_binding(XrGraphicsBindingOpenGLXlibKHR *b)
 #endif
 
 /* ---- the eyes' pictures and swapchains ------------------------------------------------------------------------------------------ */
+/* one picture of ours, an offscreen RGBA8 one the game draws into, and the swapchain it is copied into: w x h */
+static void free_pic(eye_chain *c, GLuint *tex, GLuint *fbo)
+{
+    if (c->sc) xrDestroySwapchain(c->sc);
+    memset(c, 0, sizeof *c);
+    if (*fbo) del_fb(1, fbo);
+    if (*tex) glDeleteTextures(1, tex);
+    *fbo = *tex = 0;
+}
+static bool make_pic(eye_chain *c, GLuint *tex, GLuint *fbo, int w, int h)
+{
+    XrSwapchainCreateInfo ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    ci.format = chain_fmt; ci.sampleCount = 1; ci.width = (uint32_t)w; ci.height = (uint32_t)h;
+    ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
+    if (!XR_OK(xrCreateSwapchain(sess, &ci, &c->sc), "xrCreateSwapchain")) return false;
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(c->sc, 0, &n, NULL);
+    if (n > 8) n = 8;
+    for (uint32_t i = 0; i < n; i++) c->img[i] = (XrSwapchainImageOpenGLKHR){ XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR };
+    if (!XR_OK(xrEnumerateSwapchainImages(c->sc, n, &n, (XrSwapchainImageBaseHeader *)c->img), "xrEnumerateSwapchainImages")) return false;
+    c->n = n;
+    glGenTextures(1, tex);
+    glBindTexture(GL_TEXTURE_2D, *tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    gen_fb(1, fbo);
+    bind_fb(GL_FRAMEBUFFER, *fbo);
+    fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *tex, 0);
+    const GLenum st = fb_status(GL_FRAMEBUFFER);
+    bind_fb(GL_FRAMEBUFFER, 0);
+    if (st != GL_FRAMEBUFFER_COMPLETE) { fprintf(stderr, "[VR] eye picture %dx%d incomplete (0x%x)\n", w, h, st); return false; }
+    return true;
+}
 static void destroy_chains(void)
 {
-    for (int e = 0; e < 2; e++) {
-        if (chain[e].sc) xrDestroySwapchain(chain[e].sc);
-        memset(&chain[e], 0, sizeof chain[e]);
-        if (eye_fbo[e]) del_fb(1, &eye_fbo[e]);
-        if (eye_tex[e]) glDeleteTextures(1, &eye_tex[e]);
-        eye_fbo[e] = eye_tex[e] = 0;
-    }
+    for (int e = 0; e < 2; e++) free_pic(&chain[e], &eye_tex[e], &eye_fbo[e]);
     if (copy_fbo) del_fb(1, &copy_fbo);
     copy_fbo = 0; eye_w = eye_h = 0; have_pics = false;
 }
 static void want_size(int *w, int *h)
 {
     *h = 960;                                                    /* twice the board's lines */
-    *w = host.wide && host.wide() ? (*h * 16 + 4) / 9 : *h * 4 / 3;   /* widescreen: a wider screen, the world wider (Hor+) */
+    *w = !inside_on() && host.wide && host.wide() ? (*h * 16 + 4) / 9 : *h * 4 / 3;   /* widescreen: a wider screen, the world wider (Hor+);
+                                                                                       * Inside the world is all round, the screen 4:3 */
 }
 static bool make_chains(int w, int h)
 {
     destroy_chains();
-    for (int e = 0; e < 2; e++) {
-        XrSwapchainCreateInfo ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-        ci.format = chain_fmt; ci.sampleCount = 1; ci.width = (uint32_t)w; ci.height = (uint32_t)h;
-        ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
-        if (!XR_OK(xrCreateSwapchain(sess, &ci, &chain[e].sc), "xrCreateSwapchain")) { destroy_chains(); return false; }
-        uint32_t n = 0;
-        xrEnumerateSwapchainImages(chain[e].sc, 0, &n, NULL);
-        if (n > 8) n = 8;
-        for (uint32_t i = 0; i < n; i++) chain[e].img[i] = (XrSwapchainImageOpenGLKHR){ XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR };
-        if (!XR_OK(xrEnumerateSwapchainImages(chain[e].sc, n, &n, (XrSwapchainImageBaseHeader *)chain[e].img), "xrEnumerateSwapchainImages")) { destroy_chains(); return false; }
-        chain[e].n = n;
-        glGenTextures(1, &eye_tex[e]);
-        glBindTexture(GL_TEXTURE_2D, eye_tex[e]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        gen_fb(1, &eye_fbo[e]);
-        bind_fb(GL_FRAMEBUFFER, eye_fbo[e]);
-        fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, eye_tex[e], 0);
-        const GLenum st = fb_status(GL_FRAMEBUFFER);
-        bind_fb(GL_FRAMEBUFFER, 0);
-        if (st != GL_FRAMEBUFFER_COMPLETE) { fprintf(stderr, "[VR] eye picture %dx%d incomplete (0x%x)\n", w, h, st); destroy_chains(); return false; }
-    }
+    for (int e = 0; e < 2; e++)
+        if (!make_pic(&chain[e], &eye_tex[e], &eye_fbo[e], w, h)) { destroy_chains(); return false; }
     gen_fb(1, &copy_fbo);
     eye_w = w; eye_h = h;
     fprintf(stderr, "[VR] eye pictures %dx%d, swapchain format 0x%llX\n", w, h, (unsigned long long)chain_fmt);
+    return true;
+}
+/* INSIDE's eyes: the runtime's recommended size, held to ENG_XR_INSIDE_PX (tests; 1600 by default) on its longer side -- a fixed-
+ * function picture of the whole world twice a frame, on a headset's own GPU (the Steam Frame's) */
+static void destroy_ins(void)
+{
+    for (int e = 0; e < 2; e++) free_pic(&ich[e], &ins_tex[e], &ins_fbo[e]);
+    ins_w = ins_h = 0; have_ins = false;
+}
+static bool make_ins(void)
+{
+    static int cap = -1;
+    if (cap < 0) { const char *e = getenv("ENG_XR_INSIDE_PX"); cap = e && atoi(e) >= 256 ? atoi(e) : 1600; }
+    int w = ins_rw > 0 ? ins_rw : 1440, h = ins_rh > 0 ? ins_rh : 1440;
+    if (w > cap || h > cap) { const double k = (double)cap / (w > h ? w : h); w = (int)(w * k + 0.5); h = (int)(h * k + 0.5); }
+    destroy_ins();
+    for (int e = 0; e < 2; e++)
+        if (!make_pic(&ich[e], &ins_tex[e], &ins_fbo[e], w, h)) { destroy_ins(); return false; }
+    ins_w = w; ins_h = h;
+    fprintf(stderr, "[VR] inside the world: eye pictures %dx%d (the headset recommends %dx%d)\n", w, h, ins_rw, ins_rh);
     return true;
 }
 
@@ -459,7 +534,10 @@ static XrVector2f act_vec2(XrAction a, int h)
 
 /* THE AIM RAY of the hand that pulled its trigger last, against the screen's plane, in the screen's frame (x right, y up, the player on
  * +z): the gun's point in the 4:3 picture (gun_x, gun_y; gun_in = on it), and the menu pointer's in the whole picture, in the window's
- * points (the menu lays itself out in the window, and the overlay spreads the window over the whole picture) */
+ * points (the menu lays itself out in the window, and the overlay spreads the window over the whole picture).
+ *   INSIDE the world the gun is not aimed at a screen but at the world round you: the ray, in the game camera's space (a narrow
+ * eng_inside looking along it), goes to the host, which finds what it meets and where the game's own camera sees that -- the point
+ * the game's light gun aims at. A frame with no world (host.inside_aim false) aims at the screen's plane, as the screen does. */
 static void aim_update(void)
 {
     gun_ok = ptr_ok = false;
@@ -473,12 +551,30 @@ static void aim_update(void)
     const XrVector3f d = quat_rot(loc.pose.orientation, (XrVector3f){ 0, 0, -1 });
     const XrVector3f lo = rot_y(o, -anchor_yaw), ld = rot_y(d, -anchor_yaw);
     gun_ok = true; gun_in = false;
+    bool aimed = false;
+    if (inside_on() && host.inside_aim && !menu_now) {
+        eng_inside ray;
+        memset(&ray, 0, sizeof ray);
+        cam_point(loc.pose.position, ray.p);
+        double *f = ray.r[2], *rt = ray.r[0], *up = ray.r[1];
+        cam_dir(loc.pose.orientation, (XrVector3f){ 0, 0, -1 }, f);
+        rt[0] = f[2]; rt[1] = 0; rt[2] = -f[0];                  /* (0, 1, 0) x forward: level, to the right */
+        double n = sqrt(rt[0] * rt[0] + rt[2] * rt[2]);
+        if (n < 1e-6) { rt[0] = 1; rt[2] = 0; n = 1; }           /* straight up or down: any right will do */
+        rt[0] /= n; rt[2] /= n;
+        up[0] = f[1] * rt[2] - f[2] * rt[1]; up[1] = f[2] * rt[0] - f[0] * rt[2]; up[2] = f[0] * rt[1] - f[1] * rt[0];   /* forward x right */
+        ray.tl = ray.td = -0.02; ray.tr = ray.tu = 0.02;
+        float nx, ny; bool in;
+        if ((aimed = host.inside_aim(&ray, &nx, &ny, &in))) { gun_x = nx; gun_y = ny; gun_in = in; }
+    }
     if (ld.z >= -1e-4f) return;                           /* pointing away from the screen: off-screen */
     const float t = -lo.z / ld.z;
     if (t <= 0) return;
     const double u = lo.x + t * ld.x, v = lo.y + t * ld.y, hgt = scr_h();
-    gun_x = (float)(0.5 + u / scr_w43()); gun_y = (float)(0.5 - v / hgt);
-    gun_in = gun_x >= 0 && gun_x <= 1 && gun_y >= 0 && gun_y <= 1;
+    if (!aimed) {
+        gun_x = (float)(0.5 + u / scr_w43()); gun_y = (float)(0.5 - v / hgt);
+        gun_in = gun_x >= 0 && gun_x <= 1 && gun_y >= 0 && gun_y <= 1;
+    }
     const double px = 0.5 + u / (hgt * (eye_h ? (double)eye_w / eye_h : 4.0 / 3.0)), py = 0.5 - v / hgt;
     SDL_Window *win = SDL_GL_GetCurrentWindow();
     int ww = 0, wh = 0;
@@ -570,6 +666,7 @@ bool eng_xr_start(const eng_xr_host *h)
     vr_dist_cm = cfg_get("vr_distance_cm", 150); if (vr_dist_cm < 50 || vr_dist_cm > 500) vr_dist_cm = 150;
     vr_size    = cfg_get("vr_size", 100);        if (vr_size < 40 || vr_size > 250) vr_size = 100;
     vr_depth   = cfg_get("vr_depth", 100);       if (vr_depth < 0 || vr_depth > 300) vr_depth = 100;
+    vr_view    = cfg_get("vr_view", 0) == 1;
     if (!gl_load()) { fprintf(stderr, "[VR] this OpenGL has no framebuffer objects\n"); return false; }
     if (!load_loader()) return false;
     PFN_xrEnumerateInstanceExtensionProperties enum_ext = NULL; PFN_xrCreateInstance create = NULL;
@@ -652,9 +749,15 @@ bool eng_xr_start(const eng_xr_host *h)
             for (uint32_t i = 0; i < n; i++) bg.img[i] = (XrSwapchainImageOpenGLKHR){ XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR };
             if (XR_SUCCEEDED(xrEnumerateSwapchainImages(bg.sc, n, &n, (XrSwapchainImageBaseHeader *)bg.img))) bg.n = n;
         } }
+    {   XrViewConfigurationView vc[2] = { { XR_TYPE_VIEW_CONFIGURATION_VIEW }, { XR_TYPE_VIEW_CONFIGURATION_VIEW } };   /* Inside's eyes' size */
+        uint32_t nv = 0;
+        if (XR_SUCCEEDED(xrEnumerateViewConfigurationViews(inst, sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &nv, vc)) && nv >= 1) {
+            ins_rw = (int)vc[0].recommendedImageRectWidth; ins_rh = (int)vc[0].recommendedImageRectHeight;
+        } }
     if (!make_actions() || !attach_actions()) { eng_xr_stop(); return false; }
-    fprintf(stderr, "[VR] %s, %s: a %.2f m screen at %.2f m, 3D depth %d %% (%d units a metre)%s\n", runtime_name, system_name,
-            scr_w43() * eye_w / (eye_h * 4.0 / 3.0), vr_dist_cm / 100.0, vr_depth, upm, ext_frame_pad ? "; the Steam Frame's controllers" : "");
+    fprintf(stderr, "[VR] %s, %s: a %.2f m screen at %.2f m, 3D depth %d %% (%d units a metre)%s%s\n", runtime_name, system_name,
+            scr_w43() * eye_w / (eye_h * 4.0 / 3.0), vr_dist_cm / 100.0, vr_depth, upm, inside_on() ? "; inside the world" : "",
+            ext_frame_pad ? "; the Steam Frame's controllers" : "");
     return true;
 }
 
@@ -663,6 +766,7 @@ void eng_xr_stop(void)
     if (sess) {
         if (running) xrEndSession(sess);
         destroy_chains();
+        destroy_ins();
         if (bg.sc) xrDestroySwapchain(bg.sc);
         memset(&bg, 0, sizeof bg);
         for (int h = 0; h < 2; h++) if (aim_space[h]) xrDestroySpace(aim_space[h]);
@@ -826,19 +930,36 @@ static void recenter(XrTime t)
     fprintf(stderr, "[VR] screen in front of you: yaw %.0f deg, eyes at %.2f %.2f %.2f m\n", anchor_yaw * 180 / M_PI, anchor_pos.x, anchor_pos.y, anchor_pos.z);
 }
 
+/* the eyes' views at this frame's display time, in LOCAL space */
+static bool locate_eyes(XrView v[2])
+{
+    XrViewLocateInfo li = { XR_TYPE_VIEW_LOCATE_INFO };
+    li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO; li.displayTime = fstate.predictedDisplayTime; li.space = local_space;
+    XrViewState vs = { XR_TYPE_VIEW_STATE };
+    v[0] = (XrView){ XR_TYPE_VIEW }; v[1] = (XrView){ XR_TYPE_VIEW };
+    uint32_t n = 0;
+    return XR_SUCCEEDED(xrLocateViews(sess, &li, &vs, 2, &n, v)) && n == 2 && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+}
+
 static bool frame_begin(int *w, int *h)
 {
-    frame_open = frame_render = ov_on = false;
+    frame_open = frame_render = ov_on = ins_frame = false;
     if (!running) return false;
     fstate = (XrFrameState){ XR_TYPE_FRAME_STATE };
     if (!XR_OK(xrWaitFrame(sess, NULL, &fstate), "xrWaitFrame")) return false;
+    wait_ret = SDL_GetPerformanceCounter();
     if (!XR_OK(xrBeginFrame(sess, NULL), "xrBeginFrame")) return false;
     frame_open = true;
     last_time = fstate.predictedDisplayTime;
     if (recenter_pending) recenter(fstate.predictedDisplayTime);
     int ww, wh; want_size(&ww, &wh);
-    if ((ww != eye_w || wh != eye_h) && !make_chains(ww, wh)) return false;   /* widescreen switched: new pictures */
+    if ((ww != eye_w || wh != eye_h) && !make_chains(ww, wh)) return false;   /* widescreen switched (or Inside): new pictures */
     frame_render = fstate.shouldRender && eye_w > 0;
+    if (frame_render && inside_on()) {               /* INSIDE: the eyes, where they are this frame (eng_xr_inside_eye) */
+        static bool broken;                          /* (the runtime would not make them: once is enough to say so) */
+        if (!ins_w && !broken) broken = !make_ins();
+        ins_frame = ins_w > 0 && locate_eyes(ins_v);
+    }
     *w = eye_w; *h = eye_h;
     return frame_render;
 }
@@ -925,12 +1046,8 @@ static void overlay_draw(int eye)
 static bool backdrop(XrCompositionLayerProjection *pl, XrCompositionLayerProjectionView pv[2])
 {
     if (!bg.sc || !bg.n) return false;
-    XrViewLocateInfo li = { XR_TYPE_VIEW_LOCATE_INFO };
-    li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO; li.displayTime = fstate.predictedDisplayTime; li.space = local_space;
-    XrViewState vs = { XR_TYPE_VIEW_STATE };
-    XrView v[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-    uint32_t n = 0;
-    if (XR_FAILED(xrLocateViews(sess, &li, &vs, 2, &n, v)) || n != 2 || !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return false;
+    XrView v[2];
+    if (!locate_eyes(v)) return false;
     uint32_t idx = 0;
     XrSwapchainImageAcquireInfo ai = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO }; wi.timeout = XR_INFINITE_DURATION;
@@ -959,6 +1076,27 @@ static bool backdrop(XrCompositionLayerProjection *pl, XrCompositionLayerProject
     return true;
 }
 
+/* one of our pictures, byte for byte, into its swapchain's next image */
+static bool copy_pic(const eye_chain *c, GLuint fbo, int w, int h)
+{
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo ai = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO }; wi.timeout = XR_INFINITE_DURATION;
+    XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    if (!XR_OK(xrAcquireSwapchainImage(c->sc, &ai, &idx), "xrAcquireSwapchainImage")) return false;
+    bool ok = false;
+    if (XR_OK(xrWaitSwapchainImage(c->sc, &wi), "xrWaitSwapchainImage") && idx < c->n) {
+        bind_fb(GL_READ_FRAMEBUFFER, fbo);
+        bind_fb(GL_DRAW_FRAMEBUFFER, copy_fbo);
+        fb_tex(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->img[idx].image, 0);
+        blit_fb(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        fb_tex(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        ok = true;
+    }
+    xrReleaseSwapchainImage(c->sc, &ri);
+    return ok;
+}
+
 static void frame_end(void)
 {
     if (!frame_open) return;
@@ -969,40 +1107,53 @@ static void frame_end(void)
     const XrCompositionLayerBaseHeader *layers[3];
     uint32_t nl = 0;
     if (frame_render) {
-        have_pics = true;
+        have_pics = true; have_ins = ins_frame;
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_FRAMEBUFFER_SRGB);              /* a byte copy: the pictures are display values already */
-        bool ok = true;
-        for (int e = 0; e < 2 && ok; e++) {
-            uint32_t idx = 0;
-            XrSwapchainImageAcquireInfo ai = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-            XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO }; wi.timeout = XR_INFINITE_DURATION;
-            XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-            if (!XR_OK(xrAcquireSwapchainImage(chain[e].sc, &ai, &idx), "xrAcquireSwapchainImage")) { ok = false; break; }
-            if (XR_OK(xrWaitSwapchainImage(chain[e].sc, &wi), "xrWaitSwapchainImage") && idx < chain[e].n) {
-                bind_fb(GL_READ_FRAMEBUFFER, eye_fbo[e]);
-                bind_fb(GL_DRAW_FRAMEBUFFER, copy_fbo);
-                fb_tex(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, chain[e].img[idx].image, 0);
-                blit_fb(0, 0, eye_w, eye_h, 0, 0, eye_w, eye_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-                fb_tex(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-            } else ok = false;
-            xrReleaseSwapchainImage(chain[e].sc, &ri);
-        }
-        bind_fb(GL_FRAMEBUFFER, 0);
-        if (ok && backdrop(&room, room_v)) layers[nl++] = (const XrCompositionLayerBaseHeader *)&room;
-        if (ok) {
-            const XrPosef pose = screen_pose();
-            const float hgt = (float)scr_h(), wid = hgt * (float)eye_w / (float)eye_h;
-            for (int e = 0; e < 2; e++) {
-                q[e] = (XrCompositionLayerQuad){ XR_TYPE_COMPOSITION_LAYER_QUAD };
-                q[e].space = local_space;
-                q[e].eyeVisibility = e ? XR_EYE_VISIBILITY_RIGHT : XR_EYE_VISIBILITY_LEFT;
-                q[e].subImage.swapchain = chain[e].sc;
-                q[e].subImage.imageRect.extent.width = eye_w; q[e].subImage.imageRect.extent.height = eye_h;
-                q[e].pose = pose;
-                q[e].size = (XrExtent2Df){ wid, hgt };
-                layers[nl++] = (const XrCompositionLayerBaseHeader *)&q[e];
+        const XrPosef pose = screen_pose();
+        const float hgt = (float)scr_h(), wid = hgt * (float)eye_w / (float)eye_h;
+        if (ins_frame) {
+            /* INSIDE: the world's two eyes, a projection layer where they were when drawn (the runtime turns it to where they are
+             * now); the screen over it -- one picture, both eyes -- its colour premultiplied, so clear is clear */
+            const bool ok = copy_pic(&ich[0], ins_fbo[0], ins_w, ins_h) && copy_pic(&ich[1], ins_fbo[1], ins_w, ins_h) &&
+                            copy_pic(&chain[0], eye_fbo[0], eye_w, eye_h);
+            bind_fb(GL_FRAMEBUFFER, 0);
+            if (ok) {
+                for (int e = 0; e < 2; e++) {
+                    room_v[e] = (XrCompositionLayerProjectionView){ XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+                    room_v[e].pose = ins_v[e].pose; room_v[e].fov = ins_v[e].fov;
+                    room_v[e].subImage.swapchain = ich[e].sc;
+                    room_v[e].subImage.imageRect.extent.width = ins_w; room_v[e].subImage.imageRect.extent.height = ins_h;
+                }
+                room = (XrCompositionLayerProjection){ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+                room.space = local_space; room.viewCount = 2; room.views = room_v;
+                layers[nl++] = (const XrCompositionLayerBaseHeader *)&room;
+                q[0] = (XrCompositionLayerQuad){ XR_TYPE_COMPOSITION_LAYER_QUAD };
+                q[0].layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                q[0].space = local_space;
+                q[0].eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                q[0].subImage.swapchain = chain[0].sc;
+                q[0].subImage.imageRect.extent.width = eye_w; q[0].subImage.imageRect.extent.height = eye_h;
+                q[0].pose = pose;
+                q[0].size = (XrExtent2Df){ wid, hgt };
+                layers[nl++] = (const XrCompositionLayerBaseHeader *)&q[0];
             }
+        } else {
+            bool ok = true;
+            for (int e = 0; e < 2 && ok; e++) ok = copy_pic(&chain[e], eye_fbo[e], eye_w, eye_h);
+            bind_fb(GL_FRAMEBUFFER, 0);
+            if (ok && backdrop(&room, room_v)) layers[nl++] = (const XrCompositionLayerBaseHeader *)&room;
+            if (ok)
+                for (int e = 0; e < 2; e++) {
+                    q[e] = (XrCompositionLayerQuad){ XR_TYPE_COMPOSITION_LAYER_QUAD };
+                    q[e].space = local_space;
+                    q[e].eyeVisibility = e ? XR_EYE_VISIBILITY_RIGHT : XR_EYE_VISIBILITY_LEFT;
+                    q[e].subImage.swapchain = chain[e].sc;
+                    q[e].subImage.imageRect.extent.width = eye_w; q[e].subImage.imageRect.extent.height = eye_h;
+                    q[e].pose = pose;
+                    q[e].size = (XrExtent2Df){ wid, hgt };
+                    layers[nl++] = (const XrCompositionLayerBaseHeader *)&q[e];
+                }
         }
     }
     XrFrameEndInfo ei = { XR_TYPE_FRAME_END_INFO };
@@ -1011,6 +1162,46 @@ static void frame_end(void)
     XR_OK(xrEndFrame(sess, &ei), "xrEndFrame");
 }
 
+/* INSIDE in the window: the screen's picture where an eye saw it -- the eye's own frustum and its pose undone, the screen's quad at
+ * its place in LOCAL space, the picture premultiplied over the eye's (what the runtime composites) */
+static void mirror_screen(int eye, int x, int y, int w, int h)
+{
+    const XrView *v = &ins_v[eye & 1];
+    const double n = 0.05;
+    glViewport(x, y, w, h);
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_TEXTURE_BIT);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_ALPHA_TEST); glDisable(GL_CULL_FACE);
+    glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, eye_tex[0]);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glFrustum(tan(v->fov.angleLeft) * n, tan(v->fov.angleRight) * n, tan(v->fov.angleDown) * n, tan(v->fov.angleUp) * n, n, 100.0);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    const XrQuaternionf q = v->pose.orientation, qi = { -q.x, -q.y, -q.z, q.w };
+    const XrVector3f ax = quat_rot(qi, (XrVector3f){ 1, 0, 0 }), ay = quat_rot(qi, (XrVector3f){ 0, 1, 0 }), az = quat_rot(qi, (XrVector3f){ 0, 0, 1 });
+    const GLfloat m[16] = { ax.x, ax.y, ax.z, 0, ay.x, ay.y, ay.z, 0, az.x, az.y, az.z, 0, 0, 0, 0, 1 };   /* the eye's turn undone (columns) */
+    glMultMatrixf(m);
+    glTranslatef(-v->pose.position.x, -v->pose.position.y, -v->pose.position.z);
+    const XrPosef sp = screen_pose();
+    const float hgt = (float)scr_h(), wid = hgt * (float)eye_w / (float)eye_h;
+    const XrVector3f c = sp.position, r = rot_y((XrVector3f){ wid / 2, 0, 0 }, anchor_yaw);
+    glColor4f(1, 1, 1, 1);
+    glBegin(GL_QUADS);                               /* (the picture's texture has its top row last: GL's way up) */
+    glTexCoord2f(0, 0); glVertex3f(c.x - r.x, c.y - hgt / 2, c.z - r.z);
+    glTexCoord2f(1, 0); glVertex3f(c.x + r.x, c.y - hgt / 2, c.z + r.z);
+    glTexCoord2f(1, 1); glVertex3f(c.x + r.x, c.y + hgt / 2, c.z + r.z);
+    glTexCoord2f(0, 1); glVertex3f(c.x - r.x, c.y + hgt / 2, c.z - r.z);
+    glEnd();
+    glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+    glPopAttrib();
+}
+/* ENG_XR_MIRROR=2 (tests, recordings): the window shows both eyes side by side, each as the headset gets it, instead of the left one */
+static int mirror_eyes(void)
+{
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("ENG_XR_MIRROR"); n = e && atoi(e) == 2 ? 2 : 1; }
+    return n;
+}
 static void mirror(int x, int y, int w, int h, bool sharp)
 {
     int dw, dh; SDL_GL_GetDrawableSize(SDL_GL_GetCurrentWindow(), &dw, &dh);
@@ -1020,32 +1211,39 @@ static void mirror(int x, int y, int w, int h, bool sharp)
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     if (!have_pics) return;
-    bind_fb(GL_READ_FRAMEBUFFER, eye_fbo[0]);
-    bind_fb(GL_DRAW_FRAMEBUFFER, 0);
-    const int gy = dh - (y + h);                      /* GL's origin is bottom-left */
-    blit_fb(0, 0, eye_w, eye_h, x, gy, x + w, gy + h, GL_COLOR_BUFFER_BIT, sharp ? GL_NEAREST : GL_LINEAR);
-    bind_fb(GL_FRAMEBUFFER, 0);
+    const int n = mirror_eyes(), gy = dh - (y + h);  /* GL's origin is bottom-left */
+    for (int e = 0; e < n; e++) {
+        const int ex = x + w * e / n, ew = w * (e + 1) / n - w * e / n;
+        bind_fb(GL_READ_FRAMEBUFFER, have_ins ? ins_fbo[e] : eye_fbo[e]);
+        bind_fb(GL_DRAW_FRAMEBUFFER, 0);
+        blit_fb(0, 0, have_ins ? ins_w : eye_w, have_ins ? ins_h : eye_h, ex, gy, ex + ew, gy + h, GL_COLOR_BUFFER_BIT, sharp ? GL_NEAREST : GL_LINEAR);
+        bind_fb(GL_FRAMEBUFFER, 0);
+        if (have_ins) mirror_screen(e, ex, gy, ew, h);
+    }
 }
 
 /* ENG_XRTIME=1 (tests): where a headset frame's time goes. Every 600 frames, the average and the worst of the wait for the runtime
  * (xrWaitFrame), the eyes' drawing, the hand-over (xrEndFrame), the window's mirror and the rest of the game frame (the host's
- * swap, its timer, the game), and the headset's own frame period */
+ * swap, its timer, the game), the headset's own frame period, the pictures it got a second and how many came a headset frame or
+ * more late (one picture shown twice) */
 static void xr_time(const Uint64 t[5])
 {
-    static int on = -1, n;
+    static int on = -1, n, late;
     static double sum[5], worst[5];
     static Uint64 prev_end;
     if (on < 0) on = getenv("ENG_XRTIME") != NULL;
     if (!on) return;
-    const double ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
+    const double ms = 1000.0 / (double)SDL_GetPerformanceFrequency(), per = fstate.predictedDisplayPeriod / 1e6;
     const double d[5] = { (t[1] - t[0]) * ms, (t[2] - t[1]) * ms, (t[3] - t[2]) * ms, (t[4] - t[3]) * ms, prev_end ? (t[0] - prev_end) * ms : 0 };
     prev_end = t[4];
     for (int i = 0; i < 5; i++) { sum[i] += d[i]; if (d[i] > worst[i]) worst[i] = d[i]; }
+    late += per > 0 && d[0] + d[1] + d[2] + d[3] + d[4] > 1.5 * per;
     if (++n < 600) return;
-    fprintf(stderr, "[XRTIME] headset %.1f Hz | ms avg/worst: wait %.1f/%.1f  eyes %.1f/%.1f  end %.1f/%.1f  mirror %.1f/%.1f  rest %.1f/%.1f\n",
-            fstate.predictedDisplayPeriod > 0 ? 1e9 / (double)fstate.predictedDisplayPeriod : 0.0,
+    const double all = sum[0] + sum[1] + sum[2] + sum[3] + sum[4];
+    fprintf(stderr, "[XRTIME] headset %.1f Hz, %.1f pictures/s, %d late | ms avg/worst: wait %.1f/%.1f  eyes %.1f/%.1f  end %.1f/%.1f  mirror %.1f/%.1f  rest %.1f/%.1f\n",
+            per > 0 ? 1e3 / per : 0.0, all > 0 ? n * 1e3 / all : 0.0, late,
             sum[0] / n, worst[0], sum[1] / n, worst[1], sum[2] / n, worst[2], sum[3] / n, worst[3], sum[4] / n, worst[4]);
-    n = 0; memset(sum, 0, sizeof sum); memset(worst, 0, sizeof worst);
+    n = late = 0; memset(sum, 0, sizeof sum); memset(worst, 0, sizeof worst);
 }
 
 bool eng_xr_present(SDL_Window *win, void (*draw_eye)(int eye, int w, int h, void *u), void (*draw_menu)(void *u),
@@ -1063,16 +1261,28 @@ bool eng_xr_present(SDL_Window *win, void (*draw_eye)(int eye, int w, int h, voi
             if (menu_now && ptr_ok) pointer_dot(win, dw, dh);
             bind_fb(GL_FRAMEBUFFER, 0);
         }
-        for (int e = 0; e < 2; e++) {
-            eye_target(e);
-            draw_eye(e, ew, eh, u);
-            overlay_draw(e);
-        }
+        if (ins_frame) {                             /* INSIDE: the world in each eye, then the screen (and the menu on it) */
+            for (int e = 0; e < 2; e++) {
+                bind_fb(GL_FRAMEBUFFER, ins_fbo[e]);
+                glViewport(0, 0, ins_w, ins_h);
+                draw_eye(ENG_XR_INSIDE + e, ins_w, ins_h, u);
+            }
+            eye_target(0);
+            draw_eye(ENG_XR_SCREEN, ew, eh, u);
+            overlay_draw(0);
+        } else
+            for (int e = 0; e < 2; e++) {
+                eye_target(e);
+                draw_eye(e, ew, eh, u);
+                overlay_draw(e);
+            }
     }
     t[2] = SDL_GetPerformanceCounter();
     frame_end();
     t[3] = SDL_GetPerformanceCounter();
-    const int pw = eye_w > 0 ? eye_w : 4, ph = eye_h > 0 ? eye_h : 3;   /* the window: the left eye, letterboxed to its shape */
+    int pw, ph; eng_xr_eye_size(&pw, &ph);           /* the window: the left eye (or both, ENG_XR_MIRROR), letterboxed to its shape */
+    if (pw <= 0 || ph <= 0) { pw = 4; ph = 3; }
+    pw *= mirror_eyes();
     SDL_Rect r = { 0, 0, dw, (int)((double)dw * ph / pw + 0.5) };
     if (r.h > dh) { r.h = dh; r.w = (int)((double)dh * pw / ph + 0.5); }
     r.x = (dw - r.w) / 2; r.y = (dh - r.h) / 2;
@@ -1082,26 +1292,30 @@ bool eng_xr_present(SDL_Window *win, void (*draw_eye)(int eye, int w, int h, voi
     xr_time(t);
     return true;
 }
-void eng_xr_eye_size(int *w, int *h) { *w = eye_w; *h = eye_h; }
+void eng_xr_eye_size(int *w, int *h) { *w = have_ins ? ins_w : eye_w; *h = have_ins ? ins_h : eye_h; }   /* (what eng_xr_read_eye reads) */
 
 bool eng_xr_read_eye(int eye)
 {
     if (!have_pics) return false;
-    bind_fb(GL_READ_FRAMEBUFFER, eye_fbo[eye & 1]);
+    bind_fb(GL_READ_FRAMEBUFFER, have_ins ? ins_fbo[eye & 1] : eye_fbo[eye & 1]);
     return true;
 }
 void eng_xr_read_done(void) { bind_fb(GL_FRAMEBUFFER, 0); }
 
 /* ---- the VR settings, for any menu ------------------------------------------------------------------------------------------- */
-enum { V_DIST, V_SIZE, V_DEPTH, V_CENTER, V_N };
-int  eng_xr_rows(void) { return V_N; }
-bool eng_xr_row_value(int r) { return r != V_CENTER; }
+/* View (a host that draws an Inside view only): the screen, or inside the game's world; Inside, the screen carries what is not the
+ * world (the HUD), and 3D depth is the world's scale -- the eyes' distance and the head's moves alike */
+enum { V_VIEW, V_DIST, V_SIZE, V_DEPTH, V_CENTER, V_N };
+static int row_id(int r) { return host.inside ? r : r + 1; }
+int  eng_xr_rows(void) { return host.inside ? V_N : V_N - 1; }
+bool eng_xr_row_value(int r) { return row_id(r) != V_CENTER; }
 void eng_xr_row_text(int r, char *l, size_t ln, char *v, size_t vn)
 {
     *v = 0;
-    switch (r) {
-    case V_DIST:   snprintf(l, ln, "Screen distance"); snprintf(v, vn, "%.2f m", vr_dist_cm / 100.0); break;
-    case V_SIZE:   snprintf(l, ln, "Screen size"); snprintf(v, vn, "%d %%  (%.2f m wide)", vr_size, scr_h() * (eye_h ? (double)eye_w / eye_h : 4.0 / 3.0)); break;
+    switch (row_id(r)) {
+    case V_VIEW:   snprintf(l, ln, "View"); snprintf(v, vn, "%s", vr_view ? "Inside the game's world" : "A screen in front of you"); break;
+    case V_DIST:   snprintf(l, ln, "%s distance", inside_on() ? "Screen (HUD)" : "Screen"); snprintf(v, vn, "%.2f m", vr_dist_cm / 100.0); break;
+    case V_SIZE:   snprintf(l, ln, "%s size", inside_on() ? "Screen (HUD)" : "Screen"); snprintf(v, vn, "%d %%  (%.2f m wide)", vr_size, scr_h() * (eye_h ? (double)eye_w / eye_h : 4.0 / 3.0)); break;
     case V_DEPTH:  snprintf(l, ln, "3D depth"); if (vr_depth) snprintf(v, vn, "%d %%", vr_depth); else snprintf(v, vn, "OFF (flat)"); break;
     case V_CENTER: snprintf(l, ln, "Screen"); snprintf(v, vn, "Recenter in front of you"); break;
     }
@@ -1109,7 +1323,8 @@ void eng_xr_row_text(int r, char *l, size_t ln, char *v, size_t vn)
 void eng_xr_row_change(int r, int dir)
 {
     const int d = dir ? dir : 1;
-    switch (r) {
+    switch (row_id(r)) {
+    case V_VIEW:   vr_view = !vr_view; cfg_set("vr_view", vr_view); fprintf(stderr, "[VR] view: %s\n", vr_view ? "inside the world" : "the screen"); break;
     case V_DIST:   vr_dist_cm += 25 * d; if (vr_dist_cm < 50) vr_dist_cm = 50; if (vr_dist_cm > 500) vr_dist_cm = 500; cfg_set("vr_distance_cm", vr_dist_cm); break;
     case V_SIZE:   vr_size += 10 * d; if (vr_size < 40) vr_size = 40; if (vr_size > 250) vr_size = 250; cfg_set("vr_size", vr_size); break;
     case V_DEPTH:  vr_depth += 10 * d; if (vr_depth < 0) vr_depth = 0; if (vr_depth > 300) vr_depth = 300; cfg_set("vr_depth", vr_depth); break;

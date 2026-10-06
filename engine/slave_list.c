@@ -94,6 +94,28 @@ void eng_fov_probe(geo_view *gv)
     gv->t[0] = (int32_t)llround(gv->t[0] / probe_k); gv->t[1] = (int32_t)llround(gv->t[1] / probe_k);
 }
 
+/* INSIDE (slave_list.h): the object's view as the eye sees it, then the eye's frustum stretched over the 640 x 480 through the
+ * viewport's own lens K and the picture's centre (the centre offset and the clip window go: the picture is the eye's now).
+ * A point at eye-space (x, y, z) has to land at 640 (x/z - tl) / (tr - tl) across and 480 (tu - y/z) / (tu - td) down, and the
+ * geometry stage puts it at 320 + K x'/z and 240 - K y'/z: so x' = a x + b z and y' = c y + d z, with z kept (the near plane, the
+ * fog and the depth order are the eye's own depth). Linear, with a positive determinant: a back face stays one. */
+static int32_t sat_round(double v) { return v >= 2147483647.0 ? INT32_MAX : v <= -2147483648.0 ? INT32_MIN : (int32_t)llround(v); }
+void eng_inside_view(const eng_inside *in, geo_view *gv, float focal)
+{
+    memcpy(gv->lm, gv->m, sizeof gv->lm); gv->have_lm = 1;
+    const double K = focal > 0.0f ? focal : 1.0, w = in->tr - in->tl, h = in->tu - in->td;
+    const double a = 640.0 / (K * w), b = (-640.0 * in->tl / w - 320.0) / K;
+    const double c = 480.0 / (K * h), d = (240.0 - 480.0 * in->tu / h) / K;
+    for (int k = 0; k < 4; k++) {                    /* rows 0..2: the object's axes (Q15); 3: its place, less the eye's */
+        double v[3], e[3];
+        for (int j = 0; j < 3; j++) v[j] = k < 3 ? (double)gv->m[k][j] : (double)gv->t[j] - in->p[j];
+        for (int j = 0; j < 3; j++) e[j] = in->r[j][0] * v[0] + in->r[j][1] * v[1] + in->r[j][2] * v[2];
+        int32_t *o = k < 3 ? gv->m[k] : gv->t;
+        o[0] = sat_round(a * e[0] + b * e[2]); o[1] = sat_round(c * e[1] + d * e[2]); o[2] = sat_round(e[2]);
+    }
+    gv->vx = gv->vy = 0; gv->have_clip = 0;
+}
+
 /* STEREO'S ONE EXCEPTION, A BACKDROP: a quad square on to the camera (its four corners at one depth) that covers the whole 4:3
  * picture is a picture the game draws as one polygon (Dirt Dash's stage-select map, at depth 549 -- far in front of the screen), not
  * a thing in the world: it goes back ON the screen's plane, where its captions (the text layer) are. At one depth the eye moved it
@@ -207,15 +229,17 @@ int eng_walk_list(eng_word_fn pw, const eng_list_cfg *cfg, geo_quad_cb cb, void 
                     gv.t[c] = (int32_t)(((int64_t)t[0] * viewq[0][c] +
                                          (int64_t)t[1] * viewq[1][c] +
                                          (int64_t)t[2] * viewq[2][c]) >> 15);
-                int eyed = 0;
+                const float focal = (float)zoom_mant / (float)(1ull << zoom_shift);
+                int eyed = 0, full = 0;
                 if (have_clip) {
                     const int32_t cx = 320 + vx;
-                    if ((int32_t)((float)cx + cl) <= 0 && (int32_t)((float)cx - cr - 1.0f) >= 639) {   /* a full-frame viewport */
-                        if (cfg->eye) {                  /* stereo (slave_list.h): quad_gl.c's test of one */
-                            eng_eye_view(cfg->eye, &gv, (float)zoom_mant / (float)(1ull << zoom_shift));
-                            eyed = 1;
-                        } else eng_fov_probe(&gv);
-                    }
+                    full = (int32_t)((float)cx + cl) <= 0 && (int32_t)((float)cx - cr - 1.0f) >= 639;   /* a full-frame viewport */
+                }
+                if (full && !cfg->inside) {
+                    if (cfg->eye) {                      /* stereo (slave_list.h): quad_gl.c's test of one */
+                        eng_eye_view(cfg->eye, &gv, focal);
+                        eyed = 1;
+                    } else eng_fov_probe(&gv);
                 }
                 gv.zoom_mant = zoom_mant; gv.zoom_shift = zoom_shift;
                 gv.vx = vx; gv.vy = vy;
@@ -230,13 +254,19 @@ int eng_walk_list(eng_word_fn pw, const eng_list_cfg *cfg, geo_quad_cb cb, void 
                 gv.light[2] = light_fx[2];
                 gv.ambient = amb_fx; gv.power = pow_fx;
                 gv.objectflags = objectflags;
-                geo_hw_set_view(&gv);
-                g_bbox_cur = (int)code;
-                if (eyed) {
-                    const eye_pass ep = { cb, user, 16.0 * cfg->eye->dx * cfg->eye->focal,
-                                          cfg->eye->zconv > 0 ? 1.0 / cfg->eye->zconv : 0.0 };
-                    geo_hw_object((int32_t)code, eye_quad, (void *)&ep);
-                } else geo_hw_object((int32_t)code, cb, user);
+                if (cfg->inside && full) {               /* an Inside eye (slave_list.h): the world from where it is */
+                    cfg->inside->focal = focal; cfg->inside->vx = vx; cfg->inside->vy = vy;
+                    eng_inside_view(cfg->inside, &gv, focal);
+                }
+                if (!cfg->inside || full) {              /* (an Inside walk leaves every other viewport to the screen) */
+                    geo_hw_set_view(&gv);
+                    g_bbox_cur = (int)code;
+                    if (eyed) {
+                        const eye_pass ep = { cb, user, 16.0 * cfg->eye->dx * cfg->eye->focal,
+                                              cfg->eye->zconv > 0 ? 1.0 / cfg->eye->zconv : 0.0 };
+                        geo_hw_object((int32_t)code, eye_quad, (void *)&ep);
+                    } else geo_hw_object((int32_t)code, cb, user);
+                }
                 g_bbox_cur = -1;
                 objectflags &= ~2;             /* blit_polyobject: per object */
                 prims++;
