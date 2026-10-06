@@ -16,6 +16,8 @@
  */
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>                                  /* sscanf: ENG_FOV_PROBE */
+#include <stdlib.h>                                 /* getenv, atof: ENG_FOV_PROBE */
 #include <string.h>
 #include "eng.h"
 #include "geo_hw.h"
@@ -59,6 +61,37 @@ void eng_eye_view(eng_eye *e, geo_view *gv, float focal)
     }
     gv->t[0] -= (int32_t)dx;
     e->focal = pf;
+}
+
+/* ENG_FOV_PROBE=<k>[:<yaw>] (tests): a full-frame viewport seen through a k times wider lens -- its view-space x and y over k -- and
+ * turned yaw degrees (positive = looking right), so the game's own picture shrinks into the middle 1/k (or turns away) and the rest
+ * shows what the game sent beyond its view: how much of its world it culls to its own camera (a VR camera that looks around needs
+ * the rest). Mono pictures only; sprites and the 2D layers stay where they are. */
+static double probe_k = -1, probe_yaw;
+static void probe_init(void)
+{
+    if (probe_k >= 0) return;
+    probe_k = 0;
+    const char *e = getenv("ENG_FOV_PROBE");
+    double k = 1, y = 0;
+    if (e && sscanf(e, "%lf:%lf", &k, &y) >= 1 && k >= 1.0 && (k > 1.0 || y != 0.0)) { probe_k = k; probe_yaw = y * M_PI / 180.0; }
+}
+double eng_fov_probe_k(void) { probe_init(); return probe_k; }
+void eng_fov_probe(geo_view *gv)
+{
+    probe_init();
+    if (probe_k <= 0.0) return;
+    if (probe_yaw != 0.0) {                          /* the head turned: x' = x cos - z sin, z' = x sin + z cos */
+        const double c = cos(probe_yaw), s = sin(probe_yaw);
+        for (int r = 0; r < 3; r++) {
+            const double x = gv->m[r][0], z = gv->m[r][2];
+            gv->m[r][0] = (int32_t)llround(x * c - z * s); gv->m[r][2] = (int32_t)llround(x * s + z * c);
+        }
+        const double x = gv->t[0], z = gv->t[2];
+        gv->t[0] = (int32_t)llround(x * c - z * s); gv->t[2] = (int32_t)llround(x * s + z * c);
+    }
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 2; c++) gv->m[r][c] = (int32_t)llround(gv->m[r][c] / probe_k);
+    gv->t[0] = (int32_t)llround(gv->t[0] / probe_k); gv->t[1] = (int32_t)llround(gv->t[1] / probe_k);
 }
 
 /* STEREO'S ONE EXCEPTION, A BACKDROP: a quad square on to the camera (its four corners at one depth) that covers the whole 4:3
@@ -175,11 +208,13 @@ int eng_walk_list(eng_word_fn pw, const eng_list_cfg *cfg, geo_quad_cb cb, void 
                                          (int64_t)t[1] * viewq[1][c] +
                                          (int64_t)t[2] * viewq[2][c]) >> 15);
                 int eyed = 0;
-                if (cfg->eye && have_clip) {   /* stereo (slave_list.h): a full-frame viewport only -- quad_gl.c's test of one */
+                if (have_clip) {
                     const int32_t cx = 320 + vx;
-                    if ((int32_t)((float)cx + cl) <= 0 && (int32_t)((float)cx - cr - 1.0f) >= 639) {
-                        eng_eye_view(cfg->eye, &gv, (float)zoom_mant / (float)(1ull << zoom_shift));
-                        eyed = 1;
+                    if ((int32_t)((float)cx + cl) <= 0 && (int32_t)((float)cx - cr - 1.0f) >= 639) {   /* a full-frame viewport */
+                        if (cfg->eye) {                  /* stereo (slave_list.h): quad_gl.c's test of one */
+                            eng_eye_view(cfg->eye, &gv, (float)zoom_mant / (float)(1ull << zoom_shift));
+                            eyed = 1;
+                        } else eng_fov_probe(&gv);
                     }
                 }
                 gv.zoom_mant = zoom_mant; gv.zoom_shift = zoom_shift;

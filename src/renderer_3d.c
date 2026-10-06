@@ -3224,6 +3224,9 @@ static void render_object_hw_rot(int code, float px, float py, float pz,
         if (!gv.have_clip || ((int32_t)((float)cx + gv.cl) <= 0 && (int32_t)((float)cx - gv.cr - 1.0f) >= 639)) {
             eng_eye_view(g_eye, &gv, (float)gv.zoom_mant / (float)(1u << gv.zoom_shift));
         }
+    } else if (!g_eye && eng_fov_probe_k() > 0.0 && !hud_screen_space(code) && !plain_viewport()) {
+        const int32_t cx = 320 + gv.vx;   /* ENG_FOV_PROBE (slave_list.h): the same full-frame test, the wider lens */
+        if (!gv.have_clip || ((int32_t)((float)cx + gv.cl) <= 0 && (int32_t)((float)cx - gv.cr - 1.0f) >= 639)) eng_fov_probe(&gv);
     }
     geo_hw_set_view(&gv);
     /* The point-ROM object code is the CPU list's model id PLUS 0x45.

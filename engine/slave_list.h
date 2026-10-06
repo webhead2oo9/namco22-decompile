@@ -28,6 +28,10 @@ typedef struct {
  * length `focal` (pixels): the shear above. The caller applies it only to a full-frame viewport's objects. A renderer with its own
  * walker (Prop Cycle's) uses it as eng_walk_list does. */
 void eng_eye_view(eng_eye *e, geo_view *gv, float focal);
+/* ENG_FOV_PROBE=<k>[:<yaw>] (tests, mono): a full-frame viewport's objects through a k times wider lens, turned yaw degrees
+ * (slave_list.c); eng_fov_probe_k() > 0 = on */
+double eng_fov_probe_k(void);
+void eng_fov_probe(geo_view *gv);
 
 typedef struct {
     int head;               /* ENG_LIST_HEAD_SS22 (0x304) or ENG_LIST_HEAD_S22 (0x2FF) */
