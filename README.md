@@ -304,6 +304,13 @@ Press `Esc` and open **Display**. Your choices are saved by themselves.
   window, so a smaller number runs faster on a slow computer.
 - **Aspect ratio** (when widescreen is off): 4:3 like the arcade screen, or
   stretched to fill the window.
+- **Frame rate** (all five games, Rave Racer included): how many pictures a
+  second are shown. **Auto** (the default) follows your display -- 60 on a
+  60 Hz screen, with vsync -- or pick a fixed 24, 30, 50, 60, 75, 90, 120,
+  144, 165 or 240. The game itself always runs at the arcade's speed (just
+  under 60 frames a second), whatever you pick and whatever your graphics
+  driver's vsync setting is: a lower number shows fewer pictures, a higher one
+  shows each picture more than once for a smoother picture on a fast monitor.
 
 ## VR headsets
 
@@ -357,6 +364,9 @@ so each game's controller buttons work as they do on a pad.
 
 - The 3D follows the game's camera: a zoomed-in shot (a replay's telephoto, a close-up) has less depth, so its far
   world goes no farther than the game's normal view puts it.
+- **Frame rate** doesn't apply in the headset: the headset shows the pictures at its own rate (and turns the view with
+  your head at that rate), and the game runs at the arcade's speed as always. The row is greyed out while VR runs; your
+  choice is kept for the window.
 - On Linux the game talks to the headset through X11 (XWayland on a Wayland desktop): OpenXR's OpenGL link on Linux needs it.
 - On Windows `openxr_loader.dll` sits next to the games; only `--vr` uses it.
 - Tested on Windows with a real headset (Time Crisis), and all five games in the [OpenXR Simulator](https://github.com/webhead2oo9/OpenXR-Simulator) under Wine.

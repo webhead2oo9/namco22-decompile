@@ -23,6 +23,7 @@
 #include <math.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "eng_vsync.h"
 #include "rr_hw.h"
 #include "rr_video.h"
 #include "rr_input.h"
@@ -97,11 +98,10 @@ static void out_size(int *w, int *h)   /* the window's drawable, in pixels */
     *w = 640; *h = 480;
     if (win) SDL_GL_GetDrawableSize(win, w, h);
 }
-static uint64_t next_ns;
-static bool vsync;                    /* presenting paces us (display ~60 Hz) */
+static eng_vsync vs;                  /* the frame pacer (engine/eng_vsync.h): vsync on a ~60 Hz display while it blocks, else 59.906 Hz */
 /* --vr: an OpenXR session shares the window's GL context (engine/eng_xr.h). The headset shows the picture on a big virtual screen,
- * each eye from its own walk of the list (src/rr_gl.c rr_gl_set_stereo); the window mirrors the left eye. The board's 59.906 Hz
- * timer paces the game (vsync off), xrWaitFrame paces the headset. */
+ * each eye from its own walk of the list (src/rr_gl.c rr_gl_set_stereo); the window mirrors the left eye. While a session runs the
+ * pacer's timer paces the game at the board's 59.906 Hz (eng_vsync_headset), xrWaitFrame paces the headset. */
 static bool xr_on;
 /* the game's scale for the headset, measured on the attract replay at frame 1800 (RR_STEREO_SHOTS logs the focal length; the rival's
  * quads from RR_CLIPLOG_BOX, their view-space depths read off the walk's geo_quad.rv[].z): the race's full-frame viewport has a
@@ -115,13 +115,6 @@ static void xr_cfg_set(const char *key, int v) { rr_input_vr_set("rr_controls.cf
 /* this frame's headset pad (engine/eng_xr.h eng_xr_get_pad): the two controllers in a game pad's layout, read where the real pads are */
 static eng_xr_pad xpad;
 static bool xpad_ok;
-/* the board: PIXEL_CLOCK 25.6 MHz / (HTOTAL 814 x VTOTAL 525) = 59.906 Hz */
-#define FRAME_NS 16692969ull
-static uint64_t now_ns(void)          /* split the scaling: counter * 1e9 overflows 64 bits */
-{
-    const uint64_t c = SDL_GetPerformanceCounter(), f = SDL_GetPerformanceFrequency();
-    return c / f * 1000000000ull + c % f * 1000000000ull / f;
-}
 static int paused;
 
 static const char *scaling_name[3];
@@ -216,6 +209,7 @@ void rr_host_set_wide(int on)
     if (!g_cfg_fullscreen) apply_fullscreen();     /* a window takes the new shape */
     apply_render_size();
 }
+void rr_host_set_fps(int fps) { g_cfg_fps = eng_vsync_rate_valid(fps); char v[8]; snprintf(v, sizeof v, "%d", g_cfg_fps); save_opt("frame_rate", v); }
 void rr_host_set_aspect(int a) { g_cfg_aspect = a < 0 ? 0 : a > 3 ? 3 : a; save_opt("aspect", aspect_name[g_cfg_aspect]); }
 void rr_host_set_scaling(int sc) { g_cfg_scaling = sc < 0 ? 0 : sc > 2 ? 2 : sc; apply_scaling(); save_opt("scaling", scaling_name[g_cfg_scaling]); }
 void rr_host_set_volume(int pct)
@@ -355,13 +349,6 @@ bool rr_host_open(int scale, bool vr)
                            SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
                            (g_cfg_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     if (!win) { fprintf(stderr, "[HOST] window: %s\n", SDL_GetError()); return false; }
-    /* vsync only on a ~60 Hz display: elsewhere it would run the game at the
-     * display's rate. RR_VSYNC=0/1 forces it. */
-    SDL_DisplayMode dm;
-    int hz = SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(win), &dm) == 0 ? dm.refresh_rate : 0;
-    vsync = hz >= 59 && hz <= 61;
-    const char *ev = getenv("RR_VSYNC");
-    if (ev) vsync = atoi(ev) != 0;
 #ifdef _WIN32
     /* Windows: OpenGL through pointers (engine/gl_dyn.c), the bundled Mesa if
      * the system has no usable driver */
@@ -379,20 +366,20 @@ bool rr_host_open(int scale, bool vr)
 #endif
     if (!glc) { fprintf(stderr, "[HOST] OpenGL context: %s\n", SDL_GetError()); return false; }
     SDL_GL_MakeCurrent(win, glc);
-    if (vsync && SDL_GL_SetSwapInterval(1) != 0) vsync = false;
-    if (!vsync) SDL_GL_SetSwapInterval(0);
+    eng_vsync_init(&vs, win, getenv("RR_VSYNC"));   /* vsync only on a ~60 Hz display, else 59.906 Hz; RR_VSYNC=0/1 forces it */
     fprintf(stderr, "[HOST] OpenGL: %s (%s renderer)\n", (const char *)glGetString(GL_RENDERER),
             g_rr_gl ? "engine" : "software oracle");
-    fprintf(stderr, "[HOST] display %d Hz, %s\n", hz, vsync ? "vsync" : "timer-paced at 59.906 Hz");
+    fprintf(stderr, "[HOST] display %d Hz, %s\n", vs.hz, eng_vsync_mode(&vs));
     eng_gl_warn_software((const char *)glGetString(GL_RENDERER));
     tex_bake_window_defaults();      /* a per-frame budget for cold texture bakes: a new scene sharpens over a few frames instead of one long one (ENG_TEX_BUDGET) */
 
     tex_w = 640; tex_h = 480;
     { extern int g_rr_draw_extra; g_rr_draw_extra = draw_extra[g_cfg_draw < 0 ? 0 : g_cfg_draw > 3 ? 3 : g_cfg_draw]; }
-    if (vr) {                                        /* the headset: the window shows the left eye, the timer paces the game (xrWaitFrame paces the headset) */
+    if (vr) {                                        /* the headset: the window shows the left eye; while a session runs the pacer's timer paces the game
+                                                      * (eng_vsync_headset; xrWaitFrame paces the headset) */
         const eng_xr_host xh = { "Rave Racer", RR_XR_UNITS_PER_M, RR_XR_HFOV_DEG, false, xr_wide, rr_ui_is_open, xr_cfg_get, xr_cfg_set };
         xr_on = eng_xr_start(&xh);
-        if (xr_on) { vsync = false; SDL_GL_SetSwapInterval(0); rr_ui_set_vr(true); }
+        if (xr_on) rr_ui_set_vr(true);
         else fprintf(stderr, "[HOST] no VR: playing in the window\n");
     }
     if (!rr_ui_init(win)) fprintf(stderr, "[HOST] menu: Nuklear init failed\n");
@@ -404,7 +391,7 @@ bool rr_host_open(int scale, bool vr)
     apply_render_size();
     apply_scaling();
     if (g_cfg_fullscreen) SDL_ShowCursor(SDL_DISABLE);
-    next_ns = now_ns();
+    eng_vsync_resync(&vs);
     load_pad_db();
     dev_scan();
     if (rr_audio_output_open()) rr_audio_set_volume(g_cfg_volume);
@@ -845,31 +832,13 @@ bool rr_host_frame(void)
     static eng_pace pace_log;
     if (rr_ui_is_open() || paused) eng_pace_reset(&pace_log);
     eng_pace_before_swap(&pace_log);
-    SDL_GL_SwapWindow(win);
+    eng_vsync_headset(&vs, xr_on && eng_xr_running());   /* a VR session: its pictures, the game on the timer */
+    eng_vsync_want(&vs, g_cfg_fps);                  /* Display > Frame rate (the window's): a lock shows only some frames, or each one again */
+    if (eng_vsync_show(&vs)) { eng_vsync_capture(&vs, win); SDL_GL_SwapWindow(win); }
 
-    /* TRUST VSYNC ONLY IF IT BLOCKS (Tokyo Wars' host learnt this first): a window the compositor does not throttle (an unmapped or
-     * occluded one, Wayland, some gamescope set-ups) swaps at once, and the game would then run as fast as the CPU allows -- measured
-     * over 50 frames after the first 10; a frame under 12 ms means it does not block, and the timer takes over at 59.906 Hz. */
-    { static int vs_frames; static uint64_t vs_t0;
-      if (vsync && vs_frames < 60) {
-          if (vs_frames++ == 10) vs_t0 = now_ns();
-          if (vs_frames == 60 && (now_ns() - vs_t0) / 50 < 12000000ull) {
-              vsync = false; SDL_GL_SetSwapInterval(0); next_ns = now_ns();
-              fprintf(stderr, "[HOST] vsync does not block here (%.1f ms a frame): timer-paced at 59.906 Hz\n", (double)((now_ns() - vs_t0) / 50) / 1e6);
-          }
-      } }
-
-    /* pacing: vsync blocks in RenderPresent; otherwise sleep to the board's
-     * 59.906 Hz, the last millisecond spun for precision */
-    if (!vsync) {
-        next_ns += FRAME_NS;
-        uint64_t now = now_ns();
-        if (next_ns > now) {
-            uint64_t left = next_ns - now;
-            if (left > 2000000ull) SDL_Delay((Uint32)((left - 1500000ull) / 1000000ull));
-            while (now_ns() < next_ns) ;
-        } else if (now - next_ns > 100000000ull) next_ns = now;   /* fell behind: resync, no catch-up burst */
-    }
+    /* pacing (engine/eng_vsync.h): vsync only while it BLOCKS -- re-measured every 50 frames, not only the first 60 (a window
+     * minimised later, or the driver's vsync turned off, swaps at once: GitHub #26) -- otherwise sleep to the board's 59.906 Hz */
+    eng_vsync_after_frame(&vs, win);
     eng_pace_after(&pace_log, "rr");
     return true;
 }
