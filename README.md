@@ -369,8 +369,46 @@ so each game's controller buttons work as they do on a pad.
   choice is kept for the window.
 - On Linux the game talks to the headset through X11 (XWayland on a Wayland desktop): OpenXR's OpenGL link on Linux needs it.
 - On Windows `openxr_loader.dll` sits next to the games; only `--vr` uses it.
-- Tested on Windows with a real headset (Time Crisis), and all five games in the [OpenXR Simulator](https://github.com/webhead2oo9/OpenXR-Simulator) under Wine.
-  Not tried yet: a headset on Linux.
+- Tested on Windows with a real headset (Time Crisis), on the Steam Frame (Time Crisis and Tokyo Wars; below), and all five
+  games in the [OpenXR Simulator](https://github.com/webhead2oo9/OpenXR-Simulator) under Wine.
+
+## Steam Frame
+
+All five games run on the Steam Frame as its own programs (the Frame's SteamOS is Linux for ARM chips: nothing goes
+through Proton), in the headset, with the Frame's controllers. They are built on the Frame itself, which has everything
+that takes. Put this folder and your zips on the Frame, then in a terminal there (or over `ssh` from a PC), as on any Linux:
+
+```bash
+./build.sh ~/Downloads/propcycl.zip                                       # Prop Cycle
+raverace/build.sh ~/Downloads/raverace.zip ~/Downloads/namcoc74.zip        # Rave Racer
+tokyowar/build.sh ~/Downloads/tokyowar.zip                                 # Tokyo Wars
+dirtdash/build.sh ~/Downloads/dirtdash.zip                                 # Dirt Dash
+timecris/build.sh ~/Downloads/timecris.zip                                 # Time Crisis
+```
+
+Each takes 5 to 12 minutes on the Frame. Then add each game to Steam as a non-Steam game: the program is `launch.sh` in
+this folder, the launch options `prop --vr` (or `rave --vr`, `tokyo --vr`, `dirt --vr`, `tc --vr`), and in its
+properties include it in the VR library. It starts in the headset from your library; **View** opens the menu and
+**File > Exit** ends the game.
+
+The Frame's controllers are the halves of a game controller, and each button is that controller's own:
+
+| Frame controller | Time Crisis | Prop Cycle, Rave Racer, Tokyo Wars, Dirt Dash |
+|---|---|---|
+| Triggers | Shoot | The pad's triggers (the table above) |
+| `A` / `X` | Coin | The pad's `A` / `X` |
+| `B` / `Y` | Put the screen straight in front of you | The pad's `B` / `Y` |
+| D-pad (left) | | The pad's d-pad; it also steps through the menu (not Prop Cycle's: point at it) |
+| Grips and bumpers | Foot pedal | The pad's shoulder buttons |
+| Click a stick (left / right) | | Back (coin) / Start |
+| Menu (right) | | Start |
+| View (left) | The menu | The menu |
+
+- The game is the same as on a PC: the ARM build does the x86 build's arithmetic, and the games' memory over their
+  first minute (sampled every 5 seconds; Prop Cycle's every frame) is the PC build's, byte for byte.
+- The headset shows 72 pictures a second; the game runs at the arcade's 59.906. The first time a scene appears, the
+  Frame's graphics driver prepares its shaders, which can cost a short stutter; it keeps them for next time.
+- The Frame's own head sensor, which Linux lists as a joystick, is left alone.
 
 ## If it does not work
 

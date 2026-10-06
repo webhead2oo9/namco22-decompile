@@ -2,8 +2,8 @@
  * eng_xr.h -- the game in a VR headset (engine/eng_xr.c): OpenXR, the picture on a big virtual screen in front of the player, in
  * stereo, and the motion controllers as the cabinet's light gun or as a game pad. Every game's host uses it the same way.
  *
- * The OpenXR loader is found at run time (libopenxr_loader.so.1, or openxr_loader.dll beside the .exe): a build needs no OpenXR
- * library, and without a runtime or a headset --vr says why and the game stays in its window.
+ * The OpenXR loader is found at run time (libopenxr_loader.so.1, or openxr_loader.dll beside the .exe; on the Steam Frame, SteamVR's
+ * own): a build needs no OpenXR library, and without a runtime or a headset --vr says why and the game stays in its window.
  *
  * THE SCREEN is two quad layers at one place in the room (LOCAL space), one per eye (eyeVisibility LEFT / RIGHT), each eye's picture
  * drawn by the game's renderer from that eye (eng_xr_stereo: engine/slave_list.h eng_eye). The runtime composites them at the
@@ -15,9 +15,13 @@
  * THE CONTROLLERS. A light-gun game: the aim ray hits the screen's plane, inside the 4:3 picture is where the gun points, anywhere else
  * is off-screen (a reload shot); trigger = the trigger, grip = the pedal, A / X = coin, B / Y = recenter. Any other game: the two
  * controllers are one game pad (eng_xr_get_pad): the sticks, the triggers, the grips as the shoulders, A B (right) X Y (left), a left
- * stick click = Back (coin), a right stick click = Start.
+ * stick click = Back (coin), a right stick click = Start. The Steam Frame's controllers (XR_VALVE_frame_controller_interaction) are
+ * that pad button for button: A B X Y on the right, the d-pad on the left, Menu = Start, View = the menu, the bumpers = the shoulders.
  * THE MENU is drawn on the screen, in both eyes. The menu button opens it (Touch: the left controller's; Index, WMR: a right stick click;
- * Vive: a right trackpad click); then the controller is a pointer (the trigger clicks), the stick steps, A is OK, B / Y go back.
+ * Vive: a right trackpad click; the Frame: View); then the controller is a pointer (the trigger clicks), the stick steps, A is OK, B / Y
+ * go back.
+ * TESTS: ENG_XRTIME=1 logs where a headset frame's time goes (and the headset's rate) every 600 frames; ENG_XRPAD=1 logs every change
+ * of what the controllers give the game.
  */
 #ifndef ENG_XR_H
 #define ENG_XR_H

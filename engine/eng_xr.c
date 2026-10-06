@@ -795,6 +795,21 @@ void eng_xr_poll(void)
         }
     }
     cen_prev = cen; menu_prev = menu; ok_prev = ok; open_prev = menu_now;
+    {   /* ENG_XRPAD=1 (tests): what the controllers give the game, on every change -- the pad's buttons (SDL's names), or the gun's */
+        static int on = -1; static unsigned last = ~0u;
+        if (on < 0) on = getenv("ENG_XRPAD") != NULL;
+        const unsigned now = menu_now ? 1u << 31 : host.light_gun ? buttons | (cen ? 1u << 30 : 0) : pad.buttons;
+        if (on && now != last) {
+            char s[256] = ""; size_t n = 0;
+            if (menu_now) n += (size_t)snprintf(s + n, sizeof s - n, " (the menu has them)");
+            else if (host.light_gun) n += (size_t)snprintf(s + n, sizeof s - n, "%s%s%s%s", now & ENG_XR_TRIGGER ? " trigger" : "",
+                                                           now & ENG_XR_PEDAL ? " pedal" : "", now & ENG_XR_COIN ? " coin" : "", cen ? " recenter" : "");
+            else for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && n < sizeof s - 24; b++)
+                if (now >> b & 1u) n += (size_t)snprintf(s + n, sizeof s - n, " %s", SDL_GameControllerGetStringForButton((SDL_GameControllerButton)b));
+            fprintf(stderr, "[XRPAD]%s\n", n ? s : " (none)");
+            last = now;
+        }
+    }
 }
 
 /* ---- frames ------------------------------------------------------------------------------------------------------------------- */
@@ -1012,13 +1027,37 @@ static void mirror(int x, int y, int w, int h, bool sharp)
     bind_fb(GL_FRAMEBUFFER, 0);
 }
 
+/* ENG_XRTIME=1 (tests): where a headset frame's time goes. Every 600 frames, the average and the worst of the wait for the runtime
+ * (xrWaitFrame), the eyes' drawing, the hand-over (xrEndFrame), the window's mirror and the rest of the game frame (the host's
+ * swap, its timer, the game), and the headset's own frame period */
+static void xr_time(const Uint64 t[5])
+{
+    static int on = -1, n;
+    static double sum[5], worst[5];
+    static Uint64 prev_end;
+    if (on < 0) on = getenv("ENG_XRTIME") != NULL;
+    if (!on) return;
+    const double ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
+    const double d[5] = { (t[1] - t[0]) * ms, (t[2] - t[1]) * ms, (t[3] - t[2]) * ms, (t[4] - t[3]) * ms, prev_end ? (t[0] - prev_end) * ms : 0 };
+    prev_end = t[4];
+    for (int i = 0; i < 5; i++) { sum[i] += d[i]; if (d[i] > worst[i]) worst[i] = d[i]; }
+    if (++n < 600) return;
+    fprintf(stderr, "[XRTIME] headset %.1f Hz | ms avg/worst: wait %.1f/%.1f  eyes %.1f/%.1f  end %.1f/%.1f  mirror %.1f/%.1f  rest %.1f/%.1f\n",
+            fstate.predictedDisplayPeriod > 0 ? 1e9 / (double)fstate.predictedDisplayPeriod : 0.0,
+            sum[0] / n, worst[0], sum[1] / n, worst[1], sum[2] / n, worst[2], sum[3] / n, worst[3], sum[4] / n, worst[4]);
+    n = 0; memset(sum, 0, sizeof sum); memset(worst, 0, sizeof worst);
+}
+
 bool eng_xr_present(SDL_Window *win, void (*draw_eye)(int eye, int w, int h, void *u), void (*draw_menu)(void *u),
                     bool menu_visible, void *u, bool sharp, SDL_Rect *mirror_r)
 {
     if (!running) return false;
+    Uint64 t[5]; t[0] = SDL_GetPerformanceCounter();
     int ew = 0, eh = 0, dw, dh;
     SDL_GL_GetDrawableSize(win, &dw, &dh);
-    if (frame_begin(&ew, &eh)) {
+    const bool render = frame_begin(&ew, &eh);
+    t[1] = SDL_GetPerformanceCounter();
+    if (render) {
         if (menu_visible && draw_menu && overlay_begin(dw, dh)) {   /* the menu once, at the window's size */
             draw_menu(u);
             if (menu_now && ptr_ok) pointer_dot(win, dw, dh);
@@ -1030,13 +1069,17 @@ bool eng_xr_present(SDL_Window *win, void (*draw_eye)(int eye, int w, int h, voi
             overlay_draw(e);
         }
     }
+    t[2] = SDL_GetPerformanceCounter();
     frame_end();
+    t[3] = SDL_GetPerformanceCounter();
     const int pw = eye_w > 0 ? eye_w : 4, ph = eye_h > 0 ? eye_h : 3;   /* the window: the left eye, letterboxed to its shape */
     SDL_Rect r = { 0, 0, dw, (int)((double)dw * ph / pw + 0.5) };
     if (r.h > dh) { r.h = dh; r.w = (int)((double)dh * pw / ph + 0.5); }
     r.x = (dw - r.w) / 2; r.y = (dh - r.h) / 2;
     mirror(r.x, r.y, r.w, r.h, sharp);
     if (mirror_r) *mirror_r = r;
+    t[4] = SDL_GetPerformanceCounter();
+    xr_time(t);
     return true;
 }
 void eng_xr_eye_size(int *w, int *h) { *w = eye_w; *h = eye_h; }
