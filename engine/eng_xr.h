@@ -9,7 +9,7 @@
  * drawn by the game's renderer from that eye (eng_xr_stereo: engine/slave_list.h eng_eye). The runtime composites them at the
  * headset's own rate, so looking around is smooth whatever the game's 60 Hz. The VR settings (any menu shows them: eng_xr_rows):
  *   View             (a game that draws one) the screen, or INSIDE the game's world -- below
- *   Outside the game's view  (the same games) how bright the world is where the game's camera does not look, 40 % by default
+ *   Outside the game's view  (the same games) how bright the world is where the game's camera does not look, 80 % by default
  *   Screen distance  D (m); the world's depth D * units_per_m shows ON the screen, nearer things stand out in front of it
  *   Screen size      100 % = the 4:3 picture spans the game's own field of view (life size), wider with widescreen
  *   3D depth         the eyes' distance: 100 % = 64 mm at the game's scale, 0 = a flat screen

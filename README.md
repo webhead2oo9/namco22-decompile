@@ -351,7 +351,7 @@ To reload, point off the screen and shoot, as at the arcade. The recoil is a sho
 front of a screen: you stand where the game's camera is and look all around its world, life size, in 3D, and your head's
 moves move you in it (**3D depth** is the world's scale). The time, score and bullets stay on the screen in front of you
 (its distance and size are the rows for it). The game itself can only be shot inside its own picture, the part of the world
-its camera is looking at, so **Outside the game's view** sets how bright the rest is: 40 % to begin with, from "as bright"
+its camera is looking at, so **Outside the game's view** sets how bright the rest is: 80 % to begin with, from "as bright"
 to "dark". An enemy you see there can't be hit until the camera turns to it; a shot there is off the screen. `B` / `Y` puts
 the game's view in front of you again. The arcade's white flash when you shoot isn't shown inside the world.
 
